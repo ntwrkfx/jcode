@@ -1,12 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use jcode::id::new_id;
-use jcode::message::{Message, ToolDefinition};
-use jcode::provider::{EventStream, Provider};
 use jcode::tool::{Registry, ToolContext, ToolExecutionMode};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "jcode-harness")]
@@ -15,41 +12,6 @@ struct Args {
     /// Use an explicit working directory (defaults to a temp folder).
     #[arg(long)]
     cwd: Option<String>,
-
-    /// Include network-backed tools (webfetch/websearch).
-    #[arg(long)]
-    include_network: bool,
-}
-
-struct NoopProvider;
-
-#[async_trait::async_trait]
-impl Provider for NoopProvider {
-    async fn complete(
-        &self,
-        _messages: &[Message],
-        _tools: &[ToolDefinition],
-        _system: &str,
-        _resume_session_id: Option<&str>,
-    ) -> Result<EventStream> {
-        anyhow::bail!("Noop provider - tool harness does not invoke models.")
-    }
-
-    fn name(&self) -> &str {
-        "noop"
-    }
-
-    fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(NoopProvider)
-    }
-
-    fn available_models_display(&self) -> Vec<String> {
-        vec![]
-    }
-
-    async fn prefetch_models(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 struct ToolCase {
@@ -72,8 +34,7 @@ async fn main() -> Result<()> {
     std::env::set_current_dir(&workspace)?;
     eprintln!("Harness workspace: {}", workspace.display());
 
-    let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
-    let registry = Registry::new(provider).await;
+    let registry = Registry::execution().await;
 
     let session_id = new_id("harness");
     let base_ctx = ToolContext {
@@ -134,21 +95,6 @@ async fn main() -> Result<()> {
         input: json!({"command": "pwd"}),
     });
     cases.push(ToolCase {
-        name: "invalid",
-        label: "invalid tool call",
-        input: json!({"tool": "unknown", "error": "missing required field"}),
-    });
-    cases.push(ToolCase {
-        name: "todo",
-        label: "todo write",
-        input: json!({"todos": [{"content": "harness task", "status": "pending", "priority": "low", "id": "1"}]}),
-    });
-    cases.push(ToolCase {
-        name: "todo",
-        label: "todo read",
-        input: json!({}),
-    });
-    cases.push(ToolCase {
         name: "batch",
         label: "batch ls + read",
         input: json!({
@@ -158,19 +104,6 @@ async fn main() -> Result<()> {
             ]
         }),
     });
-
-    if args.include_network {
-        cases.push(ToolCase {
-            name: "webfetch",
-            label: "webfetch example.com",
-            input: json!({"url": "https://example.com", "format": "text"}),
-        });
-        cases.push(ToolCase {
-            name: "websearch",
-            label: "websearch rust async",
-            input: json!({"query": "rust async await"}),
-        });
-    }
 
     for (idx, case) in cases.iter().enumerate() {
         let ctx = ToolContext {
