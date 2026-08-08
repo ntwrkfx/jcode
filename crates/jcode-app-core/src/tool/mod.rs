@@ -176,6 +176,37 @@ impl Registry {
         }
     }
 
+    /// Create the provider-free registry used by deterministic execution harnesses.
+    ///
+    /// This surface is intentionally narrow: it contains only local filesystem,
+    /// edit, shell, and batch primitives and does not load skills, network tools,
+    /// memory, swarm coordination, or any model/provider integration.
+    pub async fn execution() -> Self {
+        let registry = Self::empty();
+        let mut tools = HashMap::new();
+
+        Self::insert_tool(&mut tools, "read", read::ReadTool::new());
+        Self::insert_tool(&mut tools, "write", write::WriteTool::new());
+        Self::insert_tool(&mut tools, "edit", edit::EditTool::new());
+        Self::insert_tool(&mut tools, "multiedit", multiedit::MultiEditTool::new());
+        Self::insert_tool(&mut tools, "patch", patch::PatchTool::new());
+        Self::insert_tool(
+            &mut tools,
+            "apply_patch",
+            apply_patch::ApplyPatchTool::new(),
+        );
+        Self::insert_tool(&mut tools, "ls", ls::LsTool::new());
+        Self::insert_tool(&mut tools, "bash", bash::BashTool::new());
+        Self::insert_tool(
+            &mut tools,
+            "batch",
+            batch::BatchTool::new(registry.clone()),
+        );
+
+        *registry.tools.write().await = tools;
+        registry
+    }
+
     /// Base tools that are stateless and can be shared across sessions.
     /// Created once and cached in a OnceLock, then cloned (cheap Arc bumps) per session.
     fn base_tools(skills: &Arc<RwLock<SkillRegistry>>) -> HashMap<String, Arc<dyn Tool>> {

@@ -32,6 +32,29 @@ impl Provider for MockProvider {
 }
 
 #[tokio::test]
+async fn execution_registry_contains_only_deterministic_tools() {
+    let registry = Registry::execution().await;
+    let names: std::collections::BTreeSet<String> =
+        registry.tool_names().await.into_iter().collect();
+    let expected: std::collections::BTreeSet<String> = [
+        "apply_patch",
+        "bash",
+        "batch",
+        "edit",
+        "ls",
+        "multiedit",
+        "patch",
+        "read",
+        "write",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
 async fn test_tool_definitions_are_sorted() {
     // Create registry with mock provider
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
