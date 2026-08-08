@@ -114,6 +114,7 @@ pub struct ToolContext {
 pub enum ToolExecutionMode {
     AgentTurn,
     Direct,
+    ExecutionSession,
 }
 
 impl ToolContext {

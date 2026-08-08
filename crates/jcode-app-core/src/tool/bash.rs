@@ -782,6 +782,10 @@ impl BashTool {
         let timeout_duration = Duration::from_millis(timeout_ms);
 
         let has_stdin_channel = ctx.stdin_request_tx.is_some();
+        let session_owned_mode = matches!(
+            ctx.execution_mode,
+            crate::tool::ToolExecutionMode::ExecutionSession
+        );
 
         let mut command = build_shell_command(&params.command);
         command
@@ -796,7 +800,21 @@ impl BashTool {
         if let Some(ref dir) = ctx.working_dir {
             command.current_dir(dir);
         }
+        #[cfg(unix)]
+        if session_owned_mode {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn()?;
+        #[cfg(unix)]
+        let mut execution_process_group_guard = session_owned_mode
+            .then(|| ProcessGroupKillGuard::new(child.id()));
 
         let child_pid = child.id().unwrap_or(0);
         let stdin_handle = child.stdin.take();
@@ -898,6 +916,10 @@ impl BashTool {
                 };
 
                 let status = child.wait().await?;
+                #[cfg(unix)]
+                if let Some(guard) = execution_process_group_guard.as_mut() {
+                    guard.disarm();
+                }
 
                 if let Some(task) = stdin_task {
                     task.abort();
@@ -927,6 +949,12 @@ impl BashTool {
                 Err(join_err) => Err(anyhow::anyhow!("Command task panicked: {}", join_err)),
             },
             Err(_) => {
+                if session_owned_mode {
+                    work_handle.abort();
+                    let _ = work_handle.await;
+                    return Err(anyhow::anyhow!(timeout_message(timeout_ms)));
+                }
+
                 // Timed out, but the command is still running. Instead of killing
                 // it, promote it to a background task so it keeps running, renders
                 // as a background-task card, and the agent is told where to find it.

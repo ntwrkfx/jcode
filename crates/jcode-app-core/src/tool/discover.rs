@@ -138,7 +138,7 @@ impl DiscoveryRequestProvenance {
             is_canary: session.as_ref().is_some_and(|session| session.is_canary),
             execution_mode: match ctx.execution_mode {
                 ToolExecutionMode::AgentTurn => "agent_turn",
-                ToolExecutionMode::Direct => "direct",
+                ToolExecutionMode::Direct | ToolExecutionMode::ExecutionSession => "direct",
             },
             build_channel: runtime.build_channel,
             is_git_checkout: runtime.is_git_checkout,

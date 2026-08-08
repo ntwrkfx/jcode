@@ -84,3 +84,28 @@ async fn execution_session_rejects_unowned_background_bash() {
     assert!(result.is_err());
     assert!(result.err().unwrap().to_string().contains("background"));
 }
+
+#[tokio::test]
+async fn execution_session_timeout_does_not_promote_bash_to_global_background() {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let session = ExecutionSession::create(workspace.path())
+        .await
+        .expect("create execution session");
+
+    let result = session
+        .call_tool(
+            "bash",
+            json!({
+                "command": "bash -c 'sleep 0.2; touch timeout-leak.txt' & wait",
+                "timeout": 25
+            }),
+        )
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    assert!(result.is_err(), "execution-session timeout must fail");
+    assert!(
+        !workspace.path().join("timeout-leak.txt").exists(),
+        "timed-out child escaped execution-session ownership"
+    );
+}

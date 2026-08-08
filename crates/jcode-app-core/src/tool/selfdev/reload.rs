@@ -374,7 +374,7 @@ impl SelfDevTool {
         ));
 
         match execution_mode {
-            ToolExecutionMode::Direct => {
+            ToolExecutionMode::Direct | ToolExecutionMode::ExecutionSession => {
                 if SelfDevTool::is_test_session() {
                     return Ok(ToolOutput::new(format!(
                         "Reload acknowledged for build {}. Server is restarting now.",

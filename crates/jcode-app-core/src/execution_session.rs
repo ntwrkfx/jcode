@@ -73,7 +73,7 @@ impl ExecutionSession {
             working_dir: Some(self.workspace.clone()),
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
-            execution_mode: ToolExecutionMode::Direct,
+            execution_mode: ToolExecutionMode::ExecutionSession,
         };
         self.registry.execute(name, input, ctx).await
     }
