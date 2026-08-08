@@ -33,6 +33,7 @@ pub mod catchup;
 pub mod channel;
 pub mod external_auth;
 pub mod execution_session;
+pub mod execution_worker;
 pub mod mission;
 pub mod network_retry;
 pub mod notifications;
@@ -69,3 +70,7 @@ pub fn get_current_session() -> Option<String> {
 #[cfg(test)]
 #[path = "execution_session_tests.rs"]
 mod execution_session_tests;
+
+#[cfg(test)]
+#[path = "execution_worker_tests.rs"]
+mod execution_worker_tests;
