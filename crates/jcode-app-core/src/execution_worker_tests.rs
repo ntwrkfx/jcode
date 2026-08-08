@@ -41,10 +41,8 @@ async fn execution_worker_lists_deterministic_tools() {
 
     assert!(response.ok);
     let tools = response.result.unwrap().as_array().unwrap().clone();
-    let names: std::collections::BTreeSet<_> = tools
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect();
+    let names: std::collections::BTreeSet<_> =
+        tools.iter().filter_map(|value| value.as_str()).collect();
     assert_eq!(names.len(), 9);
     assert!(names.contains("read"));
     assert!(names.contains("write"));
@@ -114,5 +112,10 @@ async fn execution_worker_rejects_unknown_protocol_version() {
         .await;
     assert!(!response.ok);
     assert_eq!(response.protocol, 1);
-    assert!(response.error.unwrap().contains("unsupported execution protocol"));
+    assert!(
+        response
+            .error
+            .unwrap()
+            .contains("unsupported execution protocol")
+    );
 }

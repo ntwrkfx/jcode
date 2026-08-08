@@ -49,7 +49,10 @@ impl ExecutionWorker {
                 id: request.id,
                 ok: false,
                 result: None,
-                error: Some(format!("unsupported execution protocol: {}", request.protocol)),
+                error: Some(format!(
+                    "unsupported execution protocol: {}",
+                    request.protocol
+                )),
             };
         }
 
