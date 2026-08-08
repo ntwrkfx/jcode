@@ -32,6 +32,7 @@ pub mod build;
 pub mod catchup;
 pub mod channel;
 pub mod external_auth;
+pub mod execution_session;
 pub mod mission;
 pub mod network_retry;
 pub mod notifications;
@@ -64,3 +65,7 @@ pub fn set_current_session(session_id: &str) {
 pub fn get_current_session() -> Option<String> {
     CURRENT_SESSION_ID.lock().ok()?.clone()
 }
+
+#[cfg(test)]
+#[path = "execution_session_tests.rs"]
+mod execution_session_tests;
