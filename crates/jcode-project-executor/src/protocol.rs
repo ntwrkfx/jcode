@@ -69,3 +69,53 @@ impl WorkerResponse {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutorCommand {
+    SessionCreate {
+        execution_id: String,
+        work_identity: String,
+        repository: String,
+        base_sha: String,
+    },
+    SessionInspect {
+        execution_id: String,
+    },
+    ProcessStart {
+        execution_id: String,
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
+    ProcessRead {
+        execution_id: String,
+        process_id: String,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_limit")]
+        limit: usize,
+    },
+    ProcessWait {
+        execution_id: String,
+        process_id: String,
+        timeout_seconds: Option<f64>,
+    },
+    ProcessAbort {
+        execution_id: String,
+        process_id: String,
+    },
+    SessionClose {
+        execution_id: String,
+    },
+    Health,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorRequest {
+    pub protocol: String,
+    pub id: String,
+    pub command: ExecutorCommand,
+}
+
+pub type ExecutorResponse = WorkerResponse;

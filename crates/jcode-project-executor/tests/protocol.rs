@@ -27,3 +27,36 @@ fn protocol_rejects_shell_string_process_start() {
     .unwrap_err();
     assert!(error.to_string().contains("argv"));
 }
+
+#[test]
+fn supervisor_protocol_accepts_session_create() {
+    use jcode_project_executor::{ExecutorCommand, ExecutorRequest};
+    let request: ExecutorRequest = serde_json::from_value(serde_json::json!({
+        "protocol": "project-executor/v1",
+        "id": "create-1",
+        "command": {
+            "op": "session_create",
+            "execution_id": "77777777-7777-4777-8777-777777777777",
+            "work_identity": "local:test:protocol",
+            "repository": "/srv/repo",
+            "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }))
+    .unwrap();
+    assert!(matches!(
+        request.command,
+        ExecutorCommand::SessionCreate { .. }
+    ));
+}
+
+#[test]
+fn supervisor_protocol_rejects_shell_string_process_start() {
+    use jcode_project_executor::ExecutorRequest;
+    let error = serde_json::from_value::<ExecutorRequest>(serde_json::json!({
+        "protocol": "project-executor/v1",
+        "id": "bad-start",
+        "command": {"op": "process_start", "execution_id": "x", "command": "git status"}
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("argv"));
+}

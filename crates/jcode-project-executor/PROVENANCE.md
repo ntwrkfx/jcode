@@ -15,3 +15,11 @@ The extracted implementation intentionally changes the donor interface:
 - the crate has no dependency on jcode agent, provider, prompt, TUI, swarm, or model crates.
 
 The Harness `project-executor/v1` contract remains authoritative. Donor commit IDs are provenance only and are not protocol fields.
+Current executor layers:
+
+- M1: owned argv process plane with cursor reads, wait, abort, close-all, and JSONL worker proof;
+- M1.5: long-lived Unix-socket supervisor owns processes independently of any client connection;
+- M2: persisted session catalog recreates detached worktree/session identity after supervisor restart;
+- M3: one supervisor owns multiple isolated execution sessions and rejects cross-session process IDs.
+
+Abrupt service termination containment is a deployment property: the CT5011 systemd unit MUST use control-group kill semantics so supervisor restart/termination cannot leave descendant processes outside service ownership.
