@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
+const BWRAP_PATH: &str = "/usr/bin/bwrap";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionProcessState {
@@ -49,6 +50,7 @@ impl Drop for ProcessRecord {
 
 pub struct ExecutionProcessManager {
     workspace: PathBuf,
+    git_common_dir: Option<PathBuf>,
     state_root: PathBuf,
     processes: Mutex<HashMap<String, Arc<ProcessRecord>>>,
 }
@@ -73,11 +75,16 @@ impl ExecutionProcessManager {
         if !workspace.is_dir() {
             bail!("executor workspace must be a directory");
         }
+        if !Path::new(BWRAP_PATH).is_file() {
+            bail!("project executor requires {BWRAP_PATH}");
+        }
+        let git_common_dir = resolve_git_common_dir(&workspace)?;
         let state_root = state_root.as_ref().to_path_buf();
         std::fs::create_dir_all(state_root.join("processes"))
             .context("create executor process state directory")?;
         Ok(Self {
             workspace,
+            git_common_dir,
             state_root,
             processes: Mutex::new(HashMap::new()),
         })
@@ -105,9 +112,7 @@ impl ExecutionProcessManager {
             .context("create process output file")?;
         let stderr = output.try_clone().context("clone process output handle")?;
 
-        let mut command = Command::new(&argv[0]);
-        command.args(&argv[1..]);
-        command.current_dir(cwd);
+        let mut command = self.sandbox_command(&argv, &cwd)?;
         command.stdin(Stdio::null());
         command.stdout(Stdio::from(output));
         command.stderr(Stdio::from(stderr));
@@ -246,6 +251,93 @@ impl ExecutionProcessManager {
         Ok(state)
     }
 
+    fn sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
+        let mut command = Command::new(BWRAP_PATH);
+        command.env_clear();
+        command.args([
+            "--die-with-parent",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/etc",
+            "/etc",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--symlink",
+            "usr/sbin",
+            "/sbin",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+        ]);
+
+        let mut directories = BTreeSet::new();
+        add_mount_parents(&mut directories, &self.workspace);
+        if let Some(git_common_dir) = &self.git_common_dir {
+            add_mount_parents(&mut directories, git_common_dir);
+        }
+        for directory in directories {
+            command.arg("--dir").arg(directory);
+        }
+        command.args(["--dir", "/tmp/home"]);
+        command
+            .arg("--bind")
+            .arg(&self.workspace)
+            .arg(&self.workspace);
+        if let Some(git_common_dir) = &self.git_common_dir {
+            command
+                .arg("--bind")
+                .arg(git_common_dir)
+                .arg(git_common_dir);
+        }
+        command.args([
+            "--setenv",
+            "HOME",
+            "/tmp/home",
+            "--setenv",
+            "TMPDIR",
+            "/tmp",
+            "--setenv",
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--setenv",
+            "TERM",
+            "dumb",
+            "--setenv",
+            "USER",
+            "executor",
+            "--setenv",
+            "LOGNAME",
+            "executor",
+            "--chdir",
+        ]);
+        command.arg(cwd);
+        command.arg("--");
+        command.arg(&argv[0]);
+        command.args(&argv[1..]);
+        Ok(command)
+    }
+
     fn resolve_cwd(&self, cwd: Option<&str>) -> Result<PathBuf> {
         let candidate = match cwd {
             None => self.workspace.clone(),
@@ -263,6 +355,50 @@ impl ExecutionProcessManager {
         }
         Ok(resolved)
     }
+}
+
+fn add_mount_parents(directories: &mut BTreeSet<PathBuf>, path: &Path) {
+    let mut parents: Vec<PathBuf> = path
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| *ancestor != Path::new("/"))
+        .map(Path::to_path_buf)
+        .collect();
+    parents.reverse();
+    for parent in parents {
+        if matches!(
+            parent.to_str(),
+            Some(
+                "/usr" | "/etc" | "/proc" | "/dev" | "/tmp" | "/bin" | "/lib" | "/lib64" | "/sbin"
+            )
+        ) {
+            continue;
+        }
+        directories.insert(parent);
+    }
+}
+
+fn resolve_git_common_dir(workspace: &Path) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .context("inspect workspace git common directory")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8(output.stdout).context("decode git common directory")?;
+    let path = PathBuf::from(raw.trim())
+        .canonicalize()
+        .context("canonicalize git common directory")?;
+    if !path.is_dir() {
+        bail!(
+            "git common directory is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(Some(path))
 }
 
 #[cfg(unix)]

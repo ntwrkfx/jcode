@@ -45,6 +45,7 @@ fn spawn_supervisor(session_root: &Path, socket: &Path) -> Child {
         .args(["--session-root", session_root.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--implementation-revision", REVISION])
+        .env("PROJECT_EXECUTOR_SECRET_TEST", "ambient-secret")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -99,7 +100,7 @@ fn process_survives_controller_disconnect_and_reconnect() {
         json!({
             "protocol": "project-executor/v1", "id": "start",
             "command": {"op": "process_start", "execution_id": id,
-                "argv": ["bash", "-c", "printf started; sleep 0.15; printf done"]}
+                "argv": ["bash", "-c", "test -z \"$PROJECT_EXECUTOR_SECRET_TEST\" && printf started; sleep 0.15; printf done"]}
         }),
     );
     assert_eq!(started["ok"], true);

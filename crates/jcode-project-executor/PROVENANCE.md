@@ -23,3 +23,13 @@ Current executor layers:
 - M3: one supervisor owns multiple isolated execution sessions and rejects cross-session process IDs.
 
 Abrupt service termination containment is a deployment property: the CT5011 systemd unit MUST use control-group kill semantics so supervisor restart/termination cannot leave descendant processes outside service ownership.
+
+Project process containment is enforced with Bubblewrap on the CT5011/Linux profile:
+
+- owned workspace is the only project working tree mounted read-write;
+- the repository Git common directory is mounted read-write so Git remains functional without exposing the source working tree;
+- `/usr` and `/etc` are read-only runtime inputs;
+- `/tmp` and `HOME` are private/ephemeral;
+- PID, IPC, and UTS namespaces are private;
+- the child environment is cleared and replaced with a fixed minimal environment;
+- network namespace is intentionally shared in v1 so admitted project processes can reach build/package services; network policy remains a higher-level execution-policy concern.

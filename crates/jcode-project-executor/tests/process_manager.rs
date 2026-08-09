@@ -122,3 +122,34 @@ async fn close_all_kills_every_owned_process() {
     assert!(!workspace.path().join("close-a.txt").exists());
     assert!(!workspace.path().join("close-b.txt").exists());
 }
+
+#[tokio::test]
+async fn process_filesystem_and_environment_are_project_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = root.path().join("outside-secret.txt");
+    std::fs::write(&outside, "must-not-leak").unwrap();
+    let host_pid_namespace = std::fs::read_link("/proc/self/ns/pid").unwrap();
+    let manager = ExecutionProcessManager::create(&workspace).unwrap();
+
+    let process = manager
+        .start(
+            argv(&[
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "test ! -e '{}' && test \"$(readlink /proc/self/ns/pid)\" != '{}' && printf bounded",
+                    outside.display(),
+                    host_pid_namespace.display()
+                ),
+            ]),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = manager.wait(&process.process_id, None).await.unwrap();
+    assert_eq!(state, ExecutionProcessState::Exited { code: Some(0) });
+    let output = manager.read(&process.process_id, 0, 64).await.unwrap();
+    assert_eq!(output.data, "bounded");
+}

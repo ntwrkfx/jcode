@@ -157,3 +157,49 @@ async fn close_removes_worktree_preserves_record_and_evidence() {
         .unwrap_err();
     assert!(error.to_string().contains("closed"));
 }
+
+#[tokio::test]
+async fn git_remains_usable_inside_isolated_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let sha = make_repo(&repo);
+    let supervisor = ProjectExecutorSupervisor::create(
+        root.path().join("sessions"),
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    )
+    .unwrap();
+    let id = "88888888-8888-4888-8888-888888888888";
+    supervisor
+        .create_session(request(id, &repo, &sha))
+        .await
+        .unwrap();
+    let process = supervisor
+        .start_process(
+            id,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "test ! -e '{}/README.md' && git status --porcelain",
+                    repo.display()
+                ),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    let state = supervisor
+        .wait_process(id, &process.process_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        state,
+        jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) }
+    );
+    let output = supervisor
+        .read_process(id, &process.process_id, 0, 1024)
+        .await
+        .unwrap();
+    assert_eq!(output.data, "");
+    supervisor.close_session(id).await.unwrap();
+}
