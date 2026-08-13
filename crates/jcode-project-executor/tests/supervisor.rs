@@ -490,8 +490,15 @@ async fn incompatible_ready_session_is_quarantined_without_deleting_workspace() 
     let new_revision = "2222222222222222222222222222222222222222";
 
     let first = ProjectExecutorSupervisor::create(&sessions, old_revision).unwrap();
-    let created = first.create_session(request(id, &repo, &sha)).await.unwrap();
-    std::fs::write(Path::new(&created.workspace).join("preserve.txt"), "valuable\n").unwrap();
+    let created = first
+        .create_session(request(id, &repo, &sha))
+        .await
+        .unwrap();
+    std::fs::write(
+        Path::new(&created.workspace).join("preserve.txt"),
+        "valuable\n",
+    )
+    .unwrap();
     drop(first);
 
     let recovered = ProjectExecutorSupervisor::create(&sessions, new_revision).unwrap();
