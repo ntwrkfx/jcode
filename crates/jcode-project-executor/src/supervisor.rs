@@ -202,8 +202,17 @@ impl ProjectExecutorSupervisor {
     }
 
     async fn writer_for_path(&self, path: &Path) -> Result<Option<String>> {
+        let active_writers = self
+            .locks
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for record in self.records.lock().await.values() {
-            if record.state != SessionState::Ready {
+            if record.state != SessionState::Ready
+                || !active_writers.contains(&record.execution_id)
+            {
                 continue;
             }
             let binding = record_binding(record)?;

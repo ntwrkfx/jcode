@@ -506,4 +506,6 @@ async fn incompatible_ready_session_is_quarantined_without_deleting_workspace() 
     assert_eq!(inspection.state, SessionState::Ready);
     assert_eq!(inspection.implementation_revision, old_revision);
     assert!(Path::new(&created.workspace).join("preserve.txt").is_file());
+    let discovered = recovered.inspect_worktree(&created.workspace).await.unwrap();
+    assert_eq!(discovered.writer, None);
 }
