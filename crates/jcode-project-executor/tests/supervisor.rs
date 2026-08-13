@@ -478,3 +478,25 @@ async fn rejected_external_binding_does_not_poison_execution_id() {
     accepted.access_mode = Some(AccessMode::Read);
     supervisor.create_session(accepted).await.unwrap();
 }
+
+#[tokio::test]
+async fn incompatible_ready_session_is_quarantined_without_deleting_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let sha = make_repo(&repo);
+    let sessions = root.path().join("sessions");
+    let id = "13131313-8888-4888-8888-888888888888";
+    let old_revision = "1111111111111111111111111111111111111111";
+    let new_revision = "2222222222222222222222222222222222222222";
+
+    let first = ProjectExecutorSupervisor::create(&sessions, old_revision).unwrap();
+    let created = first.create_session(request(id, &repo, &sha)).await.unwrap();
+    std::fs::write(Path::new(&created.workspace).join("preserve.txt"), "valuable\n").unwrap();
+    drop(first);
+
+    let recovered = ProjectExecutorSupervisor::create(&sessions, new_revision).unwrap();
+    let inspection = recovered.inspect_session(id).await.unwrap();
+    assert_eq!(inspection.state, SessionState::Ready);
+    assert_eq!(inspection.implementation_revision, old_revision);
+    assert!(Path::new(&created.workspace).join("preserve.txt").is_file());
+}

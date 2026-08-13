@@ -113,11 +113,8 @@ impl ProjectExecutorSupervisor {
             }
             if record.state == SessionState::Ready {
                 if record.implementation_revision != implementation_revision {
-                    bail!(
-                        "ready session {} belongs to executor revision {}",
-                        record.execution_id,
-                        record.implementation_revision
-                    );
+                    records.insert(record.execution_id.clone(), record);
+                    continue;
                 }
                 let binding = record_binding(&record)?;
                 let workspace = PathBuf::from(&record.workspace);
