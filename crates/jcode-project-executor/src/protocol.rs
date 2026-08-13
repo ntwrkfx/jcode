@@ -1,3 +1,4 @@
+use crate::session::AccessMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -73,11 +74,19 @@ impl WorkerResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorCommand {
+    WorktreeList,
+    WorktreeInspect {
+        path: String,
+    },
     SessionCreate {
         execution_id: String,
         work_identity: String,
         repository: String,
         base_sha: String,
+        #[serde(default)]
+        worktree_path: Option<String>,
+        #[serde(default)]
+        access_mode: Option<AccessMode>,
     },
     SessionInspect {
         execution_id: String,

@@ -31,11 +31,17 @@ async fn handle_inner(
         bail!("request id must not be empty");
     }
     match request.command {
+        ExecutorCommand::WorktreeList => Ok(to_value(supervisor.list_worktrees().await?)?),
+        ExecutorCommand::WorktreeInspect { path } => {
+            Ok(to_value(supervisor.inspect_worktree(&path).await?)?)
+        }
         ExecutorCommand::SessionCreate {
             execution_id,
             work_identity,
             repository,
             base_sha,
+            worktree_path,
+            access_mode,
         } => Ok(to_value(
             supervisor
                 .create_session(SessionCreateRequest {
@@ -43,6 +49,8 @@ async fn handle_inner(
                     work_identity,
                     repository,
                     base_sha,
+                    worktree_path,
+                    access_mode,
                 })
                 .await?,
         )?),

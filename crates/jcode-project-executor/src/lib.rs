@@ -15,6 +15,9 @@ pub use protocol::{
     WorkerResponse,
 };
 pub use service::handle_executor_request;
-pub use session::{SessionCreateRequest, SessionInspection, SessionRecord, SessionState};
+pub use session::{
+    AccessMode, SessionCreateRequest, SessionInspection, SessionRecord, SessionState,
+    WorktreeBinding, WorktreeInspection, WorktreeMode, WorktreeOwnership,
+};
 pub use supervisor::ProjectExecutorSupervisor;
 pub use worker::ExecutionWorker;

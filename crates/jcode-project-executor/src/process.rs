@@ -52,6 +52,7 @@ pub struct ExecutionProcessManager {
     workspace: PathBuf,
     git_common_dir: Option<PathBuf>,
     state_root: PathBuf,
+    writable: bool,
     processes: Mutex<HashMap<String, Arc<ProcessRecord>>>,
 }
 
@@ -67,6 +68,14 @@ impl ExecutionProcessManager {
     pub fn create_with_state_root(
         workspace: impl AsRef<Path>,
         state_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::create_with_state_root_and_access(workspace, state_root, true)
+    }
+
+    pub fn create_with_state_root_and_access(
+        workspace: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        writable: bool,
     ) -> Result<Self> {
         let workspace = workspace
             .as_ref()
@@ -86,6 +95,7 @@ impl ExecutionProcessManager {
             workspace,
             git_common_dir,
             state_root,
+            writable,
             processes: Mutex::new(HashMap::new()),
         })
     }
@@ -294,13 +304,14 @@ impl ExecutionProcessManager {
             command.arg("--dir").arg(directory);
         }
         command.args(["--dir", "/tmp/home"]);
+        let bind_flag = if self.writable { "--bind" } else { "--ro-bind" };
         command
-            .arg("--bind")
+            .arg(bind_flag)
             .arg(&self.workspace)
             .arg(&self.workspace);
         if let Some(git_common_dir) = &self.git_common_dir {
             command
-                .arg("--bind")
+                .arg(bind_flag)
                 .arg(git_common_dir)
                 .arg(git_common_dir);
         }

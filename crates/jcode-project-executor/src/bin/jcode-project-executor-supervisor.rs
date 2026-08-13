@@ -11,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 struct Args {
     session_root: PathBuf,
+    worktree_root: PathBuf,
     socket: PathBuf,
     implementation_revision: String,
 }
@@ -18,6 +19,7 @@ struct Args {
 fn args() -> Result<Args> {
     let mut values = std::env::args_os().skip(1);
     let mut session_root = None;
+    let mut worktree_root = None;
     let mut socket = None;
     let mut implementation_revision = None;
     while let Some(flag) = values.next() {
@@ -26,6 +28,7 @@ fn args() -> Result<Args> {
             .ok_or_else(|| anyhow!("missing value for {:?}", flag))?;
         match flag.to_string_lossy().as_ref() {
             "--session-root" => session_root = Some(PathBuf::from(value)),
+            "--worktree-root" => worktree_root = Some(PathBuf::from(value)),
             "--socket" => socket = Some(PathBuf::from(value)),
             "--implementation-revision" => {
                 implementation_revision = Some(value.to_string_lossy().into_owned())
@@ -33,8 +36,16 @@ fn args() -> Result<Args> {
             other => bail!("unknown argument: {other}"),
         }
     }
+    let session_root = session_root.ok_or_else(|| anyhow!("missing --session-root"))?;
+    let worktree_root = worktree_root.unwrap_or_else(|| {
+        session_root
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"))
+            .to_path_buf()
+    });
     Ok(Args {
-        session_root: session_root.ok_or_else(|| anyhow!("missing --session-root"))?,
+        session_root,
+        worktree_root,
         socket: socket.ok_or_else(|| anyhow!("missing --socket"))?,
         implementation_revision: implementation_revision
             .ok_or_else(|| anyhow!("missing --implementation-revision"))?,
@@ -86,8 +97,9 @@ async fn handle_connection(
 async fn main() -> Result<()> {
     let args = args()?;
     prepare_socket(&args.socket)?;
-    let supervisor = Arc::new(ProjectExecutorSupervisor::create(
+    let supervisor = Arc::new(ProjectExecutorSupervisor::create_with_worktree_root(
         &args.session_root,
+        &args.worktree_root,
         args.implementation_revision,
     )?);
     let listener = UnixListener::bind(&args.socket).context("bind supervisor socket")?;
