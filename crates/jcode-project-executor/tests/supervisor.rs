@@ -509,3 +509,63 @@ async fn incompatible_ready_session_is_quarantined_without_deleting_workspace() 
     let discovered = recovered.inspect_worktree(&created.workspace).await.unwrap();
     assert_eq!(discovered.writer, None);
 }
+
+#[tokio::test]
+async fn matching_ready_missing_workspace_is_recorded_failed_instead_of_aborting_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let id = "41414141-4141-4141-8141-414141414141";
+    let revision = "3333333333333333333333333333333333333333";
+    let session_dir = sessions.join(id);
+    let workspace = session_dir.join("workspace");
+    std::fs::create_dir_all(session_dir.join("evidence")).unwrap();
+
+    let record = serde_json::json!({
+        "schema_version": "project-executor-session/v1",
+        "execution_id": id,
+        "provider": "project-executor",
+        "implementation": "jcode-derived-executor/v1",
+        "implementation_revision": revision,
+        "work_identity": "local:test:missing-recovery",
+        "repository": root.path().join("repo"),
+        "repository_path": root.path().join("repo"),
+        "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "branch": "main",
+        "workspace": workspace,
+        "worktree_binding": {
+            "schema_version": "worktree-binding/v1",
+            "mode": "MANAGED",
+            "ownership": "HARNESS",
+            "path": workspace,
+            "repository": root.path().join("repo"),
+            "resolved_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "access_mode": "write"
+        },
+        "state": "READY",
+        "created_at": 1,
+        "closed_at": null
+    });
+    std::fs::write(
+        session_dir.join("session.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let recovered =
+        ProjectExecutorSupervisor::create_with_worktree_root(&sessions, root.path(), revision)
+            .unwrap();
+    let inspection = recovered.inspect_session(id).await.unwrap();
+    assert_eq!(inspection.state, SessionState::Failed);
+    assert_eq!(inspection.implementation_revision, revision);
+
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(session_dir.join("session.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["state"], "FAILED");
+    let recovery: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(session_dir.join("evidence/recovery-quarantine.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovery["reason"], "READY_WORKSPACE_MISSING");
+    assert_eq!(recovery["implementation_revision"], revision);
+}

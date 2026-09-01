@@ -151,10 +151,13 @@ impl ProjectExecutorSupervisor {
                 let binding = record_binding(&record)?;
                 let workspace = PathBuf::from(&record.workspace);
                 if !workspace.is_dir() {
-                    bail!(
-                        "ready session workspace is missing: {}",
-                        workspace.display()
-                    );
+                    record_recovery_quarantine(
+                        &entry.path(),
+                        &mut record,
+                        "READY_WORKSPACE_MISSING",
+                    )?;
+                    records.insert(record.execution_id.clone(), record);
+                    continue;
                 }
                 if binding.access_mode == AccessMode::Write {
                     locks.insert(
@@ -769,6 +772,31 @@ fn now_millis() -> Result<u64> {
         .context("system clock is before unix epoch")?
         .as_millis();
     u64::try_from(millis).context("timestamp does not fit u64")
+}
+
+fn record_recovery_quarantine(
+    session_dir: &Path,
+    record: &mut SessionRecord,
+    reason: &str,
+) -> Result<()> {
+    record.state = SessionState::Failed;
+    write_record(session_dir, record)?;
+    let evidence_dir = session_dir.join("evidence");
+    std::fs::create_dir_all(&evidence_dir).context("create recovery evidence directory")?;
+    let target = evidence_dir.join("recovery-quarantine.json");
+    let temporary = evidence_dir.join("recovery-quarantine.json.tmp");
+    let payload = serde_json::json!({
+        "schema_version": "project-executor-recovery-quarantine/v1",
+        "execution_id": record.execution_id,
+        "implementation_revision": record.implementation_revision,
+        "workspace": record.workspace,
+        "reason": reason,
+        "state": "FAILED",
+    });
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&payload)?)
+        .context("write recovery quarantine evidence")?;
+    std::fs::rename(&temporary, &target).context("commit recovery quarantine evidence")?;
+    Ok(())
 }
 
 fn write_record(session_dir: &Path, record: &SessionRecord) -> Result<()> {
