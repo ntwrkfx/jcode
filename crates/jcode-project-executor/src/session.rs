@@ -45,6 +45,10 @@ pub struct WorktreeBinding {
     pub repository: String,
     pub resolved_sha: String,
     pub access_mode: AccessMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

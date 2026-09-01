@@ -8,12 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use uuid::Uuid;
 
 struct Args {
     session_root: PathBuf,
     worktree_root: PathBuf,
     socket: PathBuf,
     implementation_revision: String,
+    device_id: String,
 }
 
 fn args() -> Result<Args> {
@@ -22,6 +24,7 @@ fn args() -> Result<Args> {
     let mut worktree_root = None;
     let mut socket = None;
     let mut implementation_revision = None;
+    let mut device_id = None;
     while let Some(flag) = values.next() {
         let value = values
             .next()
@@ -33,6 +36,7 @@ fn args() -> Result<Args> {
             "--implementation-revision" => {
                 implementation_revision = Some(value.to_string_lossy().into_owned())
             }
+            "--device-id" => device_id = Some(value.to_string_lossy().into_owned()),
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -43,12 +47,15 @@ fn args() -> Result<Args> {
             .unwrap_or_else(|| std::path::Path::new("/"))
             .to_path_buf()
     });
+    let device_id = device_id.ok_or_else(|| anyhow!("missing --device-id"))?;
+    Uuid::parse_str(&device_id).context("invalid --device-id")?;
     Ok(Args {
         session_root,
         worktree_root,
         socket: socket.ok_or_else(|| anyhow!("missing --socket"))?,
         implementation_revision: implementation_revision
             .ok_or_else(|| anyhow!("missing --implementation-revision"))?,
+        device_id,
     })
 }
 
@@ -97,11 +104,14 @@ async fn handle_connection(
 async fn main() -> Result<()> {
     let args = args()?;
     prepare_socket(&args.socket)?;
-    let supervisor = Arc::new(ProjectExecutorSupervisor::create_with_worktree_root(
-        &args.session_root,
-        &args.worktree_root,
-        args.implementation_revision,
-    )?);
+    let supervisor = Arc::new(
+        ProjectExecutorSupervisor::create_with_worktree_root_and_device_id(
+            &args.session_root,
+            &args.worktree_root,
+            args.implementation_revision,
+            args.device_id,
+        )?,
+    );
     let listener = UnixListener::bind(&args.socket).context("bind supervisor socket")?;
     std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600))?;
 

@@ -50,6 +50,7 @@ pub struct ProjectExecutorSupervisor {
     worktree_root: PathBuf,
     lock_root: PathBuf,
     implementation_revision: String,
+    device_id: Option<String>,
     records: Mutex<HashMap<String, SessionRecord>>,
     managers: Mutex<HashMap<String, Arc<ExecutionProcessManager>>>,
     locks: Mutex<HashMap<String, WorktreeWriteLock>>,
@@ -68,10 +69,41 @@ impl ProjectExecutorSupervisor {
         Self::create_with_worktree_root(session_root, worktree_root, implementation_revision)
     }
 
+    pub fn create_with_worktree_root_and_device_id(
+        session_root: impl AsRef<Path>,
+        worktree_root: impl AsRef<Path>,
+        implementation_revision: impl Into<String>,
+        device_id: impl Into<String>,
+    ) -> Result<Self> {
+        let device_id = Uuid::parse_str(&device_id.into())
+            .context("invalid device_id")?
+            .to_string();
+        Self::create_with_worktree_root_inner(
+            session_root,
+            worktree_root,
+            implementation_revision,
+            Some(device_id),
+        )
+    }
+
     pub fn create_with_worktree_root(
         session_root: impl AsRef<Path>,
         worktree_root: impl AsRef<Path>,
         implementation_revision: impl Into<String>,
+    ) -> Result<Self> {
+        Self::create_with_worktree_root_inner(
+            session_root,
+            worktree_root,
+            implementation_revision,
+            None,
+        )
+    }
+
+    fn create_with_worktree_root_inner(
+        session_root: impl AsRef<Path>,
+        worktree_root: impl AsRef<Path>,
+        implementation_revision: impl Into<String>,
+        device_id: Option<String>,
     ) -> Result<Self> {
         let session_root = session_root.as_ref().to_path_buf();
         std::fs::create_dir_all(&session_root).context("create project executor session root")?;
@@ -144,6 +176,7 @@ impl ProjectExecutorSupervisor {
             worktree_root,
             lock_root,
             implementation_revision,
+            device_id,
             records: Mutex::new(records),
             managers: Mutex::new(managers),
             locks: Mutex::new(locks),
@@ -202,16 +235,9 @@ impl ProjectExecutorSupervisor {
     }
 
     async fn writer_for_path(&self, path: &Path) -> Result<Option<String>> {
-        let active_writers = self
-            .locks
-            .lock()
-            .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let active_writers = self.locks.lock().await.keys().cloned().collect::<Vec<_>>();
         for record in self.records.lock().await.values() {
-            if record.state != SessionState::Ready
-                || !active_writers.contains(&record.execution_id)
+            if record.state != SessionState::Ready || !active_writers.contains(&record.execution_id)
             {
                 continue;
             }
@@ -295,6 +321,8 @@ impl ProjectExecutorSupervisor {
                     repository: request.repository.clone(),
                     resolved_sha: request.base_sha.clone(),
                     access_mode,
+                    device_id: None,
+                    git_common_dir: None,
                 };
                 std::fs::create_dir(&session_dir).context("create executor session directory")?;
                 (workspace, session_branch, binding, false)
@@ -328,6 +356,8 @@ impl ProjectExecutorSupervisor {
                     repository: request.repository.clone(),
                     resolved_sha: request.base_sha.clone(),
                     access_mode: AccessMode::Write,
+                    device_id: None,
+                    git_common_dir: None,
                 };
                 (workspace, branch(&repository_path)?, binding, true)
             }
@@ -400,11 +430,15 @@ impl ProjectExecutorSupervisor {
 
     pub async fn inspect_session(&self, execution_id: &str) -> Result<SessionInspection> {
         let record = self.record(execution_id).await?;
-        let binding = record_binding(&record)?;
+        let mut binding = record_binding(&record)?;
         let (head_sha, clean) = if record.state == SessionState::Ready {
             let workspace = PathBuf::from(&record.workspace);
             if !workspace.is_dir() {
                 bail!("session workspace is missing: {}", workspace.display());
+            }
+            if let Some(device_id) = &self.device_id {
+                binding.device_id = Some(device_id.clone());
+                binding.git_common_dir = Some(git_common_dir(&workspace)?.display().to_string());
             }
             (
                 git(&workspace, &["rev-parse", "HEAD"])?,
@@ -553,6 +587,8 @@ fn legacy_managed_binding(record: &SessionRecord) -> WorktreeBinding {
         repository: record.repository.clone(),
         resolved_sha: record.base_sha.clone(),
         access_mode: AccessMode::Write,
+        device_id: None,
+        git_common_dir: None,
     }
 }
 

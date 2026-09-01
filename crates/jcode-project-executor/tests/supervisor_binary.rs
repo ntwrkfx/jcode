@@ -6,6 +6,38 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REVISION: &str = "dddddddddddddddddddddddddddddddddddddddd";
+const DEVICE_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test]
+fn supervisor_requires_explicit_valid_device_id() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let socket = root.path().join("executor.sock");
+
+    let mut missing = Command::new(env!("CARGO_BIN_EXE_jcode-project-executor-supervisor"))
+        .args(["--session-root", sessions.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--implementation-revision", REVISION])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    if missing.try_wait().unwrap().is_none() {
+        missing.kill().unwrap();
+        missing.wait().unwrap();
+        panic!("supervisor started without --device-id");
+    }
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_jcode-project-executor-supervisor"))
+        .args(["--session-root", sessions.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--implementation-revision", REVISION])
+        .args(["--device-id", "not-a-uuid"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid --device-id"));
+}
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -45,6 +77,7 @@ fn spawn_supervisor(session_root: &Path, socket: &Path) -> Child {
         .args(["--session-root", session_root.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--implementation-revision", REVISION])
+        .args(["--device-id", DEVICE_ID])
         .env("PROJECT_EXECUTOR_SECRET_TEST", "ambient-secret")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -212,6 +245,7 @@ fn duplicate_supervisor_refuses_active_socket() {
         .args(["--session-root", sessions.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--implementation-revision", REVISION])
+        .args(["--device-id", DEVICE_ID])
         .output()
         .unwrap();
     assert!(!output.status.success());
