@@ -60,3 +60,53 @@ fn supervisor_protocol_rejects_shell_string_process_start() {
     .unwrap_err();
     assert!(error.to_string().contains("argv"));
 }
+
+#[test]
+fn increment_b_protocol_carries_opaque_authorization_digest() {
+    use jcode_project_executor::{ExecutorCommand, ExecutorRequest};
+    let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let create: ExecutorRequest = serde_json::from_value(serde_json::json!({
+        "protocol": "project-executor/v1",
+        "id": "create-b",
+        "command": {
+            "op": "session_create",
+            "execution_id": "99999999-9999-4999-8999-999999999999",
+            "work_identity": "work:b",
+            "repository": "/srv/repo",
+            "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "authorization_digest": digest
+        }
+    }))
+    .unwrap();
+    match create.command {
+        ExecutorCommand::SessionCreate {
+            authorization_digest,
+            ..
+        } => {
+            assert_eq!(authorization_digest.as_deref(), Some(digest));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let start: ExecutorRequest = serde_json::from_value(serde_json::json!({
+        "protocol": "project-executor/v1",
+        "id": "start-b",
+        "command": {
+            "op": "process_start",
+            "execution_id": "99999999-9999-4999-8999-999999999999",
+            "argv": ["true"],
+            "cwd": null,
+            "authorization_digest": digest
+        }
+    }))
+    .unwrap();
+    match start.command {
+        ExecutorCommand::ProcessStart {
+            authorization_digest,
+            ..
+        } => {
+            assert_eq!(authorization_digest.as_deref(), Some(digest));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}

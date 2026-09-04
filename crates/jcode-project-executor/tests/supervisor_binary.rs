@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 const REVISION: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const DEVICE_ID: &str = "11111111-1111-4111-8111-111111111111";
+const AUTH_DIGEST: &str = "abababababababababababababababababababababababababababababababab";
 
 #[test]
 fn supervisor_requires_explicit_valid_device_id() {
@@ -123,7 +124,8 @@ fn process_survives_controller_disconnect_and_reconnect() {
         json!({
             "protocol": "project-executor/v1", "id": "create",
             "command": {"op": "session_create", "execution_id": id,
-                "work_identity": "local:test:disconnect", "repository": repo, "base_sha": sha}
+                "work_identity": "local:test:disconnect", "repository": repo, "base_sha": sha,
+                "authorization_digest": AUTH_DIGEST}
         }),
     );
     assert_eq!(created["ok"], true);
@@ -133,7 +135,8 @@ fn process_survives_controller_disconnect_and_reconnect() {
         json!({
             "protocol": "project-executor/v1", "id": "start",
             "command": {"op": "process_start", "execution_id": id,
-                "argv": ["bash", "-c", "test -z \"$PROJECT_EXECUTOR_SECRET_TEST\" && printf started; sleep 0.15; printf done"]}
+                "argv": ["bash", "-c", "test -z \"$PROJECT_EXECUTOR_SECRET_TEST\" && printf started; sleep 0.15; printf done"],
+                "authorization_digest": AUTH_DIGEST}
         }),
     );
     assert_eq!(started["ok"], true);
@@ -185,10 +188,19 @@ fn supervisor_restart_recovers_ready_session_catalog() {
         json!({
             "protocol": "project-executor/v1", "id": "create",
             "command": {"op": "session_create", "execution_id": id,
-                "work_identity": "local:test:restart", "repository": repo, "base_sha": sha}
+                "work_identity": "local:test:restart", "repository": repo, "base_sha": sha,
+                "authorization_digest": AUTH_DIGEST}
         }),
     );
     assert_eq!(created["ok"], true);
+    assert_eq!(
+        created["result"]["custody_assessment"]["state"],
+        "CONFIRMED"
+    );
+    let g1 = created["result"]["custody_assessment"]["generation"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     first.kill().unwrap();
     first.wait().unwrap();
 
@@ -204,7 +216,15 @@ fn supervisor_restart_recovers_ready_session_catalog() {
     assert_eq!(inspected["result"]["execution_id"], id);
     assert_eq!(inspected["result"]["head_sha"], sha);
     assert_eq!(inspected["result"]["state"], "READY");
-    assert_eq!(inspected["result"]["runnability"], "QUARANTINED");
+    assert_eq!(inspected["result"]["runnability"], "RUNNABLE");
+    assert_eq!(
+        inspected["result"]["custody_assessment"]["state"],
+        "CONFIRMED"
+    );
+    let g2 = inspected["result"]["custody_assessment"]["generation"]["token"]
+        .as_str()
+        .unwrap();
+    assert_ne!(g1, g2);
     let health = send(
         &socket,
         json!({
@@ -214,22 +234,38 @@ fn supervisor_restart_recovers_ready_session_catalog() {
     );
     assert_eq!(health["ok"], true);
     assert_eq!(health["result"]["service"]["state"], "SERVING");
-    assert_eq!(health["result"]["recovery"]["state"], "DEGRADED");
+    assert_eq!(health["result"]["recovery"]["state"], "HEALTHY");
+    assert_eq!(health["result"]["recovery"]["runnable"], 1);
     let process = send(
         &socket,
         json!({
             "protocol": "project-executor/v1", "id": "start2",
             "command": {"op": "process_start", "execution_id": id,
-                "argv": ["printf", "recovered"]}
+                "argv": ["printf", "recovered"],
+                "authorization_digest": AUTH_DIGEST}
         }),
     );
-    assert_eq!(process["ok"], false);
-    assert!(
-        process["error"]
-            .as_str()
-            .unwrap()
-            .contains("execution is not runnable")
+    assert_eq!(process["ok"], true);
+    let process_id = process["result"]["process_id"].as_str().unwrap().to_owned();
+    let waited = send(
+        &socket,
+        json!({
+            "protocol": "project-executor/v1", "id": "wait2",
+            "command": {"op": "process_wait", "execution_id": id,
+                "process_id": process_id, "timeout_seconds": 5.0}
+        }),
     );
+    assert_eq!(waited["ok"], true);
+    let read = send(
+        &socket,
+        json!({
+            "protocol": "project-executor/v1", "id": "read2",
+            "command": {"op": "process_read", "execution_id": id,
+                "process_id": process_id, "offset": 0, "limit": 64}
+        }),
+    );
+    assert_eq!(read["ok"], true);
+    assert_eq!(read["result"]["data"], "recovered");
     second.kill().unwrap();
     second.wait().unwrap();
 }

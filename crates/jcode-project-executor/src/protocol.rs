@@ -87,6 +87,8 @@ pub enum ExecutorCommand {
         worktree_path: Option<String>,
         #[serde(default)]
         access_mode: Option<AccessMode>,
+        #[serde(default)]
+        authorization_digest: Option<String>,
     },
     SessionInspect {
         execution_id: String,
@@ -95,6 +97,8 @@ pub enum ExecutorCommand {
         execution_id: String,
         argv: Vec<String>,
         cwd: Option<String>,
+        #[serde(default)]
+        authorization_digest: Option<String>,
     },
     ProcessRead {
         execution_id: String,

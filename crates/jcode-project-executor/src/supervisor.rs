@@ -1,3 +1,10 @@
+use crate::custody::{
+    CustodyAcquireRequest, CustodyEffectClaim, CustodyGrant, CustodyScope, LocalCustodyProvider,
+};
+use crate::effect::{
+    EffectAuthorizationBinding, MaterialAuthorizationClaim, WRITE_PROCESS_EFFECT_CLASS,
+    validate_authorization_digest,
+};
 use crate::process::{
     ExecutionProcessManager, ExecutionProcessOutput, ExecutionProcessRef, ExecutionProcessState,
 };
@@ -15,8 +22,6 @@ use crate::session::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -24,44 +29,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-struct WorktreeWriteLock {
-    _file: File,
-}
-
-impl WorktreeWriteLock {
-    fn acquire(lock_root: &Path, worktree: &Path) -> Result<Self> {
-        std::fs::create_dir_all(lock_root).context("create worktree lock root")?;
-        let key = stable_path_key(worktree);
-        let lock_path = lock_root.join(format!("{key:016x}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .context("open worktree lock")?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!("WORKTREE_BUSY: {}", worktree.display());
-            }
-            return Err(error).context("acquire worktree lock");
-        }
-        Ok(Self { _file: file })
-    }
-}
-
 pub struct ProjectExecutorSupervisor {
     session_root: PathBuf,
     worktree_root: PathBuf,
-    lock_root: PathBuf,
     implementation_revision: String,
     device_id: Option<String>,
     executor_instance_id: String,
     recovery_summary: RecoverySummary,
     records: Mutex<HashMap<String, SessionRecord>>,
     managers: Mutex<HashMap<String, Arc<ExecutionProcessManager>>>,
-    locks: Mutex<HashMap<String, WorktreeWriteLock>>,
+    custody_provider: Mutex<LocalCustodyProvider>,
+    custody_grants: Mutex<HashMap<String, CustodyGrant>>,
 }
 
 impl ProjectExecutorSupervisor {
@@ -129,7 +107,9 @@ impl ProjectExecutorSupervisor {
         let executor_instance_id = Uuid::new_v4().to_string();
         let mut records = HashMap::new();
         let mut managers = HashMap::new();
-        let locks = HashMap::new();
+        let mut custody_provider =
+            LocalCustodyProvider::new("PROJECT_EXECUTOR_LOCAL_FLOCK_V1", &lock_root)?;
+        let mut custody_grants = HashMap::new();
         let mut receipts = Vec::new();
         let mut unidentified_failures = 0usize;
         let mut session_dirs = Vec::new();
@@ -247,16 +227,39 @@ impl ProjectExecutorSupervisor {
                 == Some(record.expected_material.head_sha.as_str())
                 && observed_material.local_material == record.expected_material.local_material;
             let write_required = binding.access_mode == AccessMode::Write;
-            let custody = if record.implementation_revision != implementation_revision {
-                unknown_custody()
-            } else if write_required {
-                match WorktreeWriteLock::acquire(&lock_root, &workspace) {
-                    Ok(lock) => {
-                        let assessment = indeterminate_custody_after_local_lock_probe();
-                        drop(lock);
+            let mut recovered_grant = None;
+            let effect_authorization_valid = !write_required
+                || record
+                    .effect_authorization
+                    .as_ref()
+                    .map(|binding| {
+                        validate_material_authorization(
+                            &record,
+                            &workspace,
+                            Some(&binding.authorization_digest),
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or(false);
+            let eligible_for_custody = record.lifecycle == SessionLifecycle::Ready
+                && record.implementation_revision == implementation_revision
+                && binding_matches
+                && material_sufficiently_known
+                && material_matches
+                && effect_authorization_valid;
+            let custody = if write_required && eligible_for_custody {
+                match custody_provider.acquire(CustodyAcquireRequest {
+                    scope: custody_scope(&record.execution_id, &workspace)?,
+                    executor_instance_id: executor_instance_id.clone(),
+                }) {
+                    Ok(grant) => {
+                        let assessment = custody_provider.assess(&grant);
+                        recovered_grant = Some(grant);
                         assessment
                     }
-                    Err(error) if error.to_string().contains("WORKTREE_BUSY") => not_held_custody(),
+                    Err(error) if error.to_string().contains("CUSTODY_NOT_CURRENT") => {
+                        not_held_custody()
+                    }
                     Err(_) => unknown_custody(),
                 }
             } else {
@@ -286,12 +289,20 @@ impl ProjectExecutorSupervisor {
                 ) {
                     Ok(manager) => {
                         managers.insert(record.execution_id.clone(), Arc::new(manager));
+                        if let Some(grant) = recovered_grant.take() {
+                            custody_grants.insert(record.execution_id.clone(), grant);
+                        }
                     }
                     Err(_) => {
+                        if let Some(grant) = recovered_grant.take() {
+                            let _ = custody_provider.release(&grant);
+                        }
                         decision.result = SessionRunnability::Quarantined;
                         decision.reason_codes = vec![RecoveryReasonCode::RecoveryProbeFailed];
                     }
                 }
+            } else if let Some(grant) = recovered_grant.take() {
+                let _ = custody_provider.release(&grant);
             }
             record.runnability = decision.result;
             record.custody_assessment = Some(custody.clone());
@@ -322,14 +333,14 @@ impl ProjectExecutorSupervisor {
         Ok(Self {
             session_root,
             worktree_root,
-            lock_root,
             implementation_revision,
             device_id,
             executor_instance_id,
             recovery_summary,
             records: Mutex::new(records),
             managers: Mutex::new(managers),
-            locks: Mutex::new(locks),
+            custody_provider: Mutex::new(custody_provider),
+            custody_grants: Mutex::new(custody_grants),
         })
     }
 
@@ -393,7 +404,13 @@ impl ProjectExecutorSupervisor {
     }
 
     async fn writer_for_path(&self, path: &Path) -> Result<Option<String>> {
-        let active_writers = self.locks.lock().await.keys().cloned().collect::<Vec<_>>();
+        let active_writers = self
+            .custody_grants
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for record in self.records.lock().await.values() {
             if record.lifecycle != SessionLifecycle::Ready
                 || !active_writers.contains(&record.execution_id)
@@ -418,6 +435,15 @@ impl ProjectExecutorSupervisor {
             bail!("work_identity must not be empty");
         }
         validate_sha(&request.base_sha, "base_sha")?;
+        let write_requested =
+            request.worktree_path.is_none() || request.access_mode == Some(AccessMode::Write);
+        if write_requested {
+            let digest = request
+                .authorization_digest
+                .as_deref()
+                .ok_or_else(|| anyhow!("EFFECT_AUTHORIZATION_DIGEST_MISSING"))?;
+            validate_authorization_digest(digest)?;
+        }
         if self
             .records
             .lock()
@@ -523,14 +549,41 @@ impl ProjectExecutorSupervisor {
         };
 
         std::fs::create_dir(&evidence).context("create executor evidence directory")?;
-        let write_lock = if binding.access_mode == AccessMode::Write {
-            match WorktreeWriteLock::acquire(&self.lock_root, &workspace) {
-                Ok(lock) => Some(lock),
+        let effect_authorization = if binding.access_mode == AccessMode::Write {
+            Some(EffectAuthorizationBinding {
+                work_id: request.work_identity.clone(),
+                execution_id: request.execution_id.clone(),
+                resource_identity: request.repository.clone(),
+                workspace_identity: workspace
+                    .canonicalize()
+                    .context("canonicalize effect workspace")?
+                    .display()
+                    .to_string(),
+                candidate_revision: request.base_sha.clone(),
+                effect_class: WRITE_PROCESS_EFFECT_CLASS.to_owned(),
+                authorization_digest: request
+                    .authorization_digest
+                    .clone()
+                    .ok_or_else(|| anyhow!("EFFECT_AUTHORIZATION_DIGEST_MISSING"))?,
+            })
+        } else {
+            None
+        };
+        let custody_grant = if binding.access_mode == AccessMode::Write {
+            let request = CustodyAcquireRequest {
+                scope: custody_scope(&request.execution_id, &workspace)?,
+                executor_instance_id: self.executor_instance_id.clone(),
+            };
+            match self.custody_provider.lock().await.acquire(request) {
+                Ok(grant) => Some(grant),
                 Err(error) => {
                     if managed_created {
                         let _ = remove_managed_worktree(&repository_path, &workspace);
                     }
                     let _ = std::fs::remove_dir_all(&session_dir);
+                    if error.to_string().contains("CUSTODY_NOT_CURRENT") {
+                        bail!("WORKTREE_BUSY: {}", workspace.display());
+                    }
                     return Err(error);
                 }
             }
@@ -544,7 +597,9 @@ impl ProjectExecutorSupervisor {
         ) {
             Ok(manager) => Arc::new(manager),
             Err(error) => {
-                drop(write_lock);
+                if let Some(grant) = custody_grant.as_ref() {
+                    let _ = self.custody_provider.lock().await.release(grant);
+                }
                 if managed_created {
                     let _ = remove_managed_worktree(&repository_path, &workspace);
                 }
@@ -576,7 +631,11 @@ impl ProjectExecutorSupervisor {
                 head_sha: request.base_sha.clone(),
                 local_material: LocalMaterialState::None,
             },
-            custody_assessment: None,
+            custody_assessment: match custody_grant.as_ref() {
+                Some(grant) => Some(self.custody_provider.lock().await.assess(grant)),
+                None => None,
+            },
+            effect_authorization,
             created_at: now_millis()?,
             closed_at: None,
         };
@@ -589,11 +648,11 @@ impl ProjectExecutorSupervisor {
             .lock()
             .await
             .insert(record.execution_id.clone(), manager);
-        if let Some(lock) = write_lock {
-            self.locks
+        if let Some(grant) = custody_grant {
+            self.custody_grants
                 .lock()
                 .await
-                .insert(record.execution_id.clone(), lock);
+                .insert(record.execution_id.clone(), grant);
         }
         self.inspect_session(&record.execution_id).await
     }
@@ -637,6 +696,7 @@ impl ProjectExecutorSupervisor {
             runnability: record.runnability,
             workspace_origin: record.workspace_origin,
             custody_assessment: record.custody_assessment,
+            effect_authorization: record.effect_authorization,
             created_at: record.created_at,
             closed_at: record.closed_at,
             head_sha,
@@ -649,8 +709,37 @@ impl ProjectExecutorSupervisor {
         execution_id: &str,
         argv: Vec<String>,
         cwd: Option<String>,
+        authorization_digest: Option<String>,
     ) -> Result<ExecutionProcessRef> {
         let manager = self.manager(execution_id).await?;
+        let record = self.record(execution_id).await?;
+        let binding = record_binding(&record)?;
+        if binding.access_mode == AccessMode::Write {
+            validate_material_authorization(
+                &record,
+                Path::new(&record.workspace),
+                authorization_digest.as_deref(),
+            )?;
+            let grant = self
+                .custody_grants
+                .lock()
+                .await
+                .get(execution_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("CUSTODY_NOT_CURRENT: execution has no current grant"))?;
+            let provider = self.custody_provider.lock().await;
+            validate_effect_time_custody(
+                &provider,
+                &grant,
+                execution_id,
+                Path::new(&record.workspace),
+                &self.executor_instance_id,
+            )?;
+            let local = manager.start(argv, cwd).await?;
+            return Ok(ExecutionProcessRef {
+                process_id: namespace_process_id(execution_id, &local.process_id),
+            });
+        }
         let local = manager.start(argv, cwd).await?;
         Ok(ExecutionProcessRef {
             process_id: namespace_process_id(execution_id, &local.process_id),
@@ -709,7 +798,9 @@ impl ProjectExecutorSupervisor {
         {
             remove_managed_worktree(Path::new(&record.repository_path), &workspace)?;
         }
-        self.locks.lock().await.remove(execution_id);
+        if let Some(grant) = self.custody_grants.lock().await.remove(execution_id) {
+            self.custody_provider.lock().await.release(&grant)?;
+        }
         record.lifecycle = SessionLifecycle::Closed;
         record.runnability = SessionRunnability::Quarantined;
         record.closed_at = Some(now_millis()?);
@@ -916,13 +1007,58 @@ fn canonical_repository_from_origin(origin: &str) -> Option<String> {
     None
 }
 
-fn stable_path_key(path: &Path) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in path.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn validate_material_authorization(
+    record: &SessionRecord,
+    workspace: &Path,
+    presented_digest: Option<&str>,
+) -> Result<()> {
+    let expected = record
+        .effect_authorization
+        .as_ref()
+        .ok_or_else(|| anyhow!("EFFECT_AUTHORIZATION_MISSING"))?;
+    let digest = presented_digest.ok_or_else(|| anyhow!("EFFECT_AUTHORIZATION_DIGEST_MISSING"))?;
+    let claim = MaterialAuthorizationClaim {
+        work_id: record.work_identity.clone(),
+        execution_id: record.execution_id.clone(),
+        resource_identity: record.repository.clone(),
+        workspace_identity: workspace
+            .canonicalize()
+            .context("canonicalize material authorization workspace")?
+            .display()
+            .to_string(),
+        candidate_revision: record.base_sha.clone(),
+        effect_class: WRITE_PROCESS_EFFECT_CLASS.to_owned(),
+        authorization_digest: digest.to_owned(),
+    };
+    expected.validate(&claim)
+}
+
+fn validate_effect_time_custody(
+    provider: &LocalCustodyProvider,
+    grant: &CustodyGrant,
+    execution_id: &str,
+    workspace: &Path,
+    executor_instance_id: &str,
+) -> Result<()> {
+    let claim = CustodyEffectClaim {
+        execution_id: execution_id.to_owned(),
+        collision_identity: custody_scope(execution_id, workspace)?.collision_identity,
+        executor_instance_id: executor_instance_id.to_owned(),
+        generation: Some(grant.generation.clone()),
+    };
+    provider.validate_effect(&claim)
+}
+
+fn custody_scope(execution_id: &str, workspace: &Path) -> Result<CustodyScope> {
+    let collision_identity = workspace
+        .canonicalize()
+        .context("canonicalize custody workspace")?
+        .display()
+        .to_string();
+    Ok(CustodyScope {
+        execution_id: execution_id.to_owned(),
+        collision_identity,
+    })
 }
 
 fn namespace_process_id(execution_id: &str, local_id: &str) -> String {
@@ -951,6 +1087,7 @@ fn now_millis() -> Result<u64> {
     u64::try_from(millis).context("timestamp does not fit u64")
 }
 
+#[cfg(test)]
 fn indeterminate_custody_after_local_lock_probe() -> CustodyAssessment {
     CustodyAssessment {
         state: CustodyState::Unknown,
@@ -1086,11 +1223,211 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
 mod increment_a_contract_tests {
     use super::*;
 
+    const B_AUTH_DIGEST: &str = "abababababababababababababababababababababababababababababababab";
+
     #[test]
     fn local_lock_probe_does_not_mint_custody_generation() {
         let assessment = indeterminate_custody_after_local_lock_probe();
         assert_eq!(assessment.state, CustodyState::Unknown);
         assert_eq!(assessment.executor_instance_id, None);
         assert_eq!(assessment.generation, None);
+    }
+
+    fn make_b_test_repo(path: &Path) -> String {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(path, &["config", "user.name", "Custody B Test"]).unwrap();
+        git(path, &["config", "user.email", "custody-b@example.invalid"]).unwrap();
+        std::fs::write(path.join("README.md"), "b\n").unwrap();
+        std::fs::write(path.join(".gitignore"), "effect-*\n").unwrap();
+        git(path, &["add", "README.md", ".gitignore"]).unwrap();
+        git(path, &["commit", "-q", "-m", "b"]).unwrap();
+        git(path, &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    #[test]
+    fn effect_time_process_start_rejects_released_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let id = "ffffffff-1111-4111-8111-111111111111";
+        let executor = "executor-b-test";
+        let mut provider =
+            LocalCustodyProvider::new("TEST_LOCAL_FLOCK", root.path().join("locks")).unwrap();
+        let grant = provider
+            .acquire(CustodyAcquireRequest {
+                scope: custody_scope(id, &workspace).unwrap(),
+                executor_instance_id: executor.to_owned(),
+            })
+            .unwrap();
+        provider.release(&grant).unwrap();
+        let error =
+            validate_effect_time_custody(&provider, &grant, id, &workspace, executor).unwrap_err();
+        assert!(error.to_string().contains("CUSTODY_NOT_CURRENT"));
+    }
+    #[tokio::test]
+    async fn stale_generation_is_rejected_at_actual_material_effect_boundary() {
+        if !Path::new("/usr/bin/bwrap").is_file() {
+            return; // Native-bwrap acceptance environment proves the material effects.
+        }
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo-material-fence");
+        let sha = make_b_test_repo(&repo);
+        let sessions = root.path().join("sessions-material-fence");
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let revision = "edededededededededededededededededededed";
+
+        let first = ProjectExecutorSupervisor::create(&sessions, revision).unwrap();
+        let created = first
+            .create_session(SessionCreateRequest {
+                execution_id: id.to_owned(),
+                work_identity: "work:test:b-material-fence".to_owned(),
+                repository: repo.display().to_string(),
+                base_sha: sha,
+                worktree_path: None,
+                access_mode: None,
+                authorization_digest: Some(B_AUTH_DIGEST.to_owned()),
+            })
+            .await
+            .unwrap();
+        let workspace = PathBuf::from(created.workspace.clone());
+        let g1 = first.custody_grants.lock().await.get(id).cloned().unwrap();
+        let a = first
+            .start_process(
+                id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf A > effect-A".to_owned(),
+                ],
+                None,
+                Some(B_AUTH_DIGEST.to_owned()),
+            )
+            .await
+            .unwrap();
+        first.wait_process(id, &a.process_id, None).await.unwrap();
+        assert!(workspace.join("effect-A").is_file());
+        drop(first);
+
+        let second = ProjectExecutorSupervisor::create(&sessions, revision).unwrap();
+        let g2 = second.custody_grants.lock().await.get(id).cloned().unwrap();
+        assert_ne!(g1.generation, g2.generation);
+
+        let wrong_authorization = second
+            .start_process(
+                id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf X > effect-X".to_owned(),
+                ],
+                None,
+                Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_owned()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            wrong_authorization
+                .to_string()
+                .contains("EFFECT_AUTHORIZATION_DIGEST_MISMATCH")
+        );
+        assert!(!workspace.join("effect-X").exists());
+
+        second
+            .custody_grants
+            .lock()
+            .await
+            .insert(id.to_owned(), g1.clone());
+        let stale = second
+            .start_process(
+                id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf B > effect-B".to_owned(),
+                ],
+                None,
+                Some(B_AUTH_DIGEST.to_owned()),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("CUSTODY_GENERATION_STALE"));
+        assert!(!workspace.join("effect-B").exists());
+
+        second.custody_grants.lock().await.insert(id.to_owned(), g2);
+        let c = second
+            .start_process(
+                id,
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf C > effect-C".to_owned(),
+                ],
+                None,
+                Some(B_AUTH_DIGEST.to_owned()),
+            )
+            .await
+            .unwrap();
+        second.wait_process(id, &c.process_id, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("effect-A")).unwrap(),
+            "A"
+        );
+        assert!(!workspace.join("effect-B").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("effect-C")).unwrap(),
+            "C"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_session_never_mints_write_custody() {
+        if !Path::new("/usr/bin/bwrap").is_file() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo-read-only");
+        let sha = make_b_test_repo(&repo);
+        let external = root.path().join("external-read-only");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&external)
+                .arg(&sha)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        let supervisor = ProjectExecutorSupervisor::create_with_worktree_root(
+            root.path().join("sessions-read-only"),
+            root.path(),
+            "fdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfd",
+        )
+        .unwrap();
+        let inspection = supervisor
+            .create_session(SessionCreateRequest {
+                execution_id: id.to_owned(),
+                work_identity: "work:test:b-read-only".to_owned(),
+                repository: repo.display().to_string(),
+                base_sha: sha,
+                worktree_path: Some(external.display().to_string()),
+                access_mode: Some(AccessMode::Read),
+                authorization_digest: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(inspection.runnability, SessionRunnability::Runnable);
+        assert_eq!(inspection.custody_assessment, None);
+        assert!(!supervisor.custody_grants.lock().await.contains_key(id));
     }
 }

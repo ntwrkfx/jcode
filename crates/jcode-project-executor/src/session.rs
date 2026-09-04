@@ -1,3 +1,4 @@
+use crate::effect::EffectAuthorizationBinding;
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_SCHEMA_VERSION: &str = "project-executor-session/v2";
@@ -75,6 +76,12 @@ pub struct CustodyAssessment {
     pub evidence_ref: Option<String>,
 }
 
+impl CustodyAssessment {
+    pub fn is_confirmed(&self) -> bool {
+        self.state == CustodyState::Confirmed
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorktreeMode {
@@ -135,6 +142,7 @@ pub struct SessionCreateRequest {
     pub base_sha: String,
     pub worktree_path: Option<String>,
     pub access_mode: Option<AccessMode>,
+    pub authorization_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +167,8 @@ pub struct SessionRecord {
     pub expected_material: ExpectedMaterial,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody_assessment: Option<CustodyAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_authorization: Option<EffectAuthorizationBinding>,
     pub created_at: u64,
     pub closed_at: Option<u64>,
 }
@@ -182,6 +192,7 @@ pub struct SessionInspection {
     pub runnability: SessionRunnability,
     pub workspace_origin: WorkspaceOrigin,
     pub custody_assessment: Option<CustodyAssessment>,
+    pub effect_authorization: Option<EffectAuthorizationBinding>,
     pub created_at: u64,
     pub closed_at: Option<u64>,
     pub head_sha: String,

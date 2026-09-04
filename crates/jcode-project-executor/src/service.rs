@@ -42,6 +42,7 @@ async fn handle_inner(
             base_sha,
             worktree_path,
             access_mode,
+            authorization_digest,
         } => Ok(to_value(
             supervisor
                 .create_session(SessionCreateRequest {
@@ -51,6 +52,7 @@ async fn handle_inner(
                     base_sha,
                     worktree_path,
                     access_mode,
+                    authorization_digest,
                 })
                 .await?,
         )?),
@@ -61,8 +63,11 @@ async fn handle_inner(
             execution_id,
             argv,
             cwd,
+            authorization_digest,
         } => Ok(to_value(
-            supervisor.start_process(&execution_id, argv, cwd).await?,
+            supervisor
+                .start_process(&execution_id, argv, cwd, authorization_digest)
+                .await?,
         )?),
         ExecutorCommand::ProcessRead {
             execution_id,
