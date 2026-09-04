@@ -165,3 +165,74 @@ async fn invalid_execution_id_is_rejected_before_retirement_evidence_path_resolu
     assert!(error.to_string().contains("execution_id must be a UUID"));
     assert!(!root.path().join("escape").exists());
 }
+
+#[tokio::test]
+async fn wrong_resource_identity_is_denied_before_retirement_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo-resource");
+    let sha = make_repo(&repo);
+    let workspace = root.path().join("managed-resource");
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "--detach"])
+            .arg(&workspace)
+            .arg(&sha)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sessions = root.path().join("sessions-resource");
+    let execution_id = "cb000000-0000-4000-8000-00000000000c";
+    let session_dir = sessions.join(execution_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let workspace_identity = workspace.canonicalize().unwrap().display().to_string();
+    let record = serde_json::json!({
+        "schema_version":"project-executor-session/v2", "execution_id":execution_id,
+        "provider":"project-executor", "implementation":"jcode-derived-executor/v1",
+        "implementation_revision":REVISION, "work_identity":"work:test:c-resource",
+        "repository":"RESOURCE-ACTUAL", "repository_path":repo, "base_sha":sha, "branch":"detached",
+        "workspace":workspace, "worktree_binding":{"schema_version":"worktree-binding/v1","mode":"MANAGED","ownership":"HARNESS","path":workspace,"repository":"RESOURCE-ACTUAL","resolved_sha":sha,"access_mode":"write"},
+        "lifecycle":"CLOSED", "runnability":"QUARANTINED", "workspace_origin":"MANAGED",
+        "expected_material":{"head_sha":sha,"local_material":"NONE"}, "custody_assessment":null,
+        "effect_authorization":null, "created_at":1, "closed_at":2
+    });
+    std::fs::write(
+        session_dir.join("session.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let binding = EffectAuthorizationBinding {
+        work_id: "work:test:c-resource".into(),
+        execution_id: execution_id.into(),
+        resource_identity: "RESOURCE-WRONG".into(),
+        workspace_identity: workspace_identity.clone(),
+        candidate_revision: sha.clone(),
+        effect_class: WORKSPACE_RETIRE_EFFECT_CLASS.into(),
+        authorization_digest: DIGEST.into(),
+    };
+    let intent = RetirementIntent {
+        retirement_intent_id: "retire-wrong-resource".into(),
+        work_id: binding.work_id.clone(),
+        execution_id: execution_id.into(),
+        resource_identity: binding.resource_identity.clone(),
+        workspace_identity,
+        candidate_revision: sha.clone(),
+        effect_class: WORKSPACE_RETIRE_EFFECT_CLASS.into(),
+        authorization_digest: DIGEST.into(),
+        authorization_binding: Some(binding),
+        expected_material: ExpectedMaterial {
+            head_sha: sha,
+            local_material: LocalMaterialState::None,
+        },
+        disposition: RetirementDisposition::DiscardCleanManagedWorkspace,
+    };
+    let supervisor =
+        ProjectExecutorSupervisor::create_with_worktree_root(&sessions, root.path(), REVISION)
+            .unwrap();
+    let receipt = supervisor.retire_workspace(intent).await.unwrap();
+    assert_eq!(receipt.outcome, RetirementOutcome::Denied);
+    assert_eq!(receipt.reason, Some(RetirementReasonCode::ScopeMismatch));
+    assert!(workspace.exists());
+}
