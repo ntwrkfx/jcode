@@ -1180,7 +1180,6 @@ fn validate_retirement_authorization(
     if intent.effect_class != WORKSPACE_RETIRE_EFFECT_CLASS
         || intent.work_id != record.work_identity
         || intent.execution_id != record.execution_id
-        || intent.resource_identity != record.repository
         || intent.candidate_revision != record.base_sha
         || intent.expected_material != record.expected_material
     {
