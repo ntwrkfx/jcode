@@ -106,6 +106,31 @@ async fn handle_inner(
         ExecutorCommand::SessionClose { execution_id } => {
             Ok(to_value(supervisor.close_session(&execution_id).await?)?)
         }
+        ExecutorCommand::UpgradePrepare {
+            execution_id,
+            attempt_id,
+            expected_successor_revision,
+            checkpoint_generation,
+        } => Ok(to_value(
+            supervisor
+                .prepare_transactional_upgrade(
+                    &execution_id,
+                    &attempt_id,
+                    &expected_successor_revision,
+                    checkpoint_generation,
+                )
+                .await?,
+        )?),
+        ExecutorCommand::UpgradeInspect => {
+            Ok(to_value(supervisor.inspect_transactional_upgrade())?)
+        }
+        ExecutorCommand::UpgradeResume {
+            intent,
+            external_event_payload,
+        } => Ok(to_value(supervisor.resume_transactional_upgrade(
+            intent,
+            &external_event_payload,
+        )?)?),
         ExecutorCommand::Health => {
             let recovery = supervisor.recovery_summary();
             Ok(json!({

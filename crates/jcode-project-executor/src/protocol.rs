@@ -1,4 +1,5 @@
 use crate::session::AccessMode;
+use crate::transactional_upgrade::ResumeIntent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -119,6 +120,17 @@ pub enum ExecutorCommand {
     },
     SessionClose {
         execution_id: String,
+    },
+    UpgradePrepare {
+        execution_id: String,
+        attempt_id: String,
+        expected_successor_revision: String,
+        checkpoint_generation: u64,
+    },
+    UpgradeInspect,
+    UpgradeResume {
+        intent: ResumeIntent,
+        external_event_payload: String,
     },
     Health,
 }

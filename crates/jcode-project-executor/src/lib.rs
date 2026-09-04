@@ -10,6 +10,7 @@ pub mod retirement;
 mod service;
 mod session;
 mod supervisor;
+pub mod transactional_upgrade;
 mod worker;
 
 pub use process::{
@@ -32,4 +33,8 @@ pub use session::{
     WorktreeMode, WorktreeOwnership,
 };
 pub use supervisor::ProjectExecutorSupervisor;
+pub use transactional_upgrade::{
+    ResumeIntent, TransactionalUpgradeRequest, TransactionalUpgradeState,
+    TransactionalUpgradeStore, UpgradePhase, event_digest,
+};
 pub use worker::ExecutionWorker;

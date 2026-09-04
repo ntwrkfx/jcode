@@ -25,13 +25,18 @@ use crate::session::{
     WORKTREE_BINDING_SCHEMA_VERSION, WORKTREE_INSPECTION_SCHEMA_VERSION, WorkspaceOrigin,
     WorktreeBinding, WorktreeInspection, WorktreeMode, WorktreeOwnership,
 };
+use crate::transactional_upgrade::{
+    ResumeIntent, TransactionalUpgradeRequest, TransactionalUpgradeState,
+    TransactionalUpgradeStore, UpgradePhase, material_identity, material_observation_identity,
+    new_transaction_id,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 pub struct ProjectExecutorSupervisor {
@@ -45,6 +50,9 @@ pub struct ProjectExecutorSupervisor {
     managers: Mutex<HashMap<String, Arc<ExecutionProcessManager>>>,
     custody_provider: Mutex<LocalCustodyProvider>,
     custody_grants: Mutex<HashMap<String, CustodyGrant>>,
+    upgrade_store: TransactionalUpgradeStore,
+    upgrade_state: StdMutex<Option<TransactionalUpgradeState>>,
+    admission_gate: RwLock<()>,
 }
 
 impl ProjectExecutorSupervisor {
@@ -109,6 +117,16 @@ impl ProjectExecutorSupervisor {
         std::fs::create_dir_all(&lock_root).context("create project executor lock root")?;
         let implementation_revision = implementation_revision.into();
         validate_sha(&implementation_revision, "implementation_revision")?;
+        let upgrade_store = TransactionalUpgradeStore::new(
+            session_root
+                .join(".transactional-upgrade")
+                .join("state.json"),
+        );
+        let mut upgrade_state = if upgrade_store.path().is_file() {
+            Some(upgrade_store.load()?)
+        } else {
+            None
+        };
         let executor_instance_id = Uuid::new_v4().to_string();
         let mut records = HashMap::new();
         let mut managers = HashMap::new();
@@ -232,6 +250,11 @@ impl ProjectExecutorSupervisor {
                 == Some(record.expected_material.head_sha.as_str())
                 && observed_material.local_material == record.expected_material.local_material;
             let write_required = binding.access_mode == AccessMode::Write;
+            let revision_matches = recovery_revision_matches(
+                upgrade_state.as_ref(),
+                &record,
+                &implementation_revision,
+            );
             let mut recovered_grant = None;
             let effect_authorization_valid = !write_required
                 || record
@@ -247,7 +270,7 @@ impl ProjectExecutorSupervisor {
                     })
                     .unwrap_or(false);
             let eligible_for_custody = record.lifecycle == SessionLifecycle::Ready
-                && record.implementation_revision == implementation_revision
+                && revision_matches
                 && binding_matches
                 && material_sufficiently_known
                 && material_matches
@@ -274,7 +297,7 @@ impl ProjectExecutorSupervisor {
                 lifecycle: record.lifecycle,
                 workspace_origin: record.workspace_origin,
                 schema_understood: true,
-                revision_matches: record.implementation_revision == implementation_revision,
+                revision_matches,
                 binding_matches,
                 material_matches,
                 material_sufficiently_known,
@@ -309,6 +332,11 @@ impl ProjectExecutorSupervisor {
             } else if let Some(grant) = recovered_grant.take() {
                 let _ = custody_provider.release(&grant);
             }
+            if decision.result == SessionRunnability::Runnable
+                && pending_upgrade_targets(upgrade_state.as_ref(), &record.execution_id)
+            {
+                record.implementation_revision = implementation_revision.clone();
+            }
             record.runnability = decision.result;
             record.custody_assessment = Some(custody.clone());
             write_record(&session_dir, &record)?;
@@ -335,6 +363,46 @@ impl ProjectExecutorSupervisor {
                     RecoveryHealth::Degraded
                 };
         }
+        if let Some(state) = upgrade_state.as_mut() {
+            if state.phase != UpgradePhase::Complete && state.phase != UpgradePhase::Failed {
+                let execution_id = state.request.execution_id.clone();
+                let recovered = records
+                    .get(&execution_id)
+                    .filter(|record| record.runnability == SessionRunnability::Runnable)
+                    .cloned();
+                let grant = custody_grants.get(&execution_id).cloned();
+                let reconcile = match (recovered.as_ref(), grant.as_ref()) {
+                    (Some(record), Some(grant)) => (|| -> Result<()> {
+                        let observed_material = observe_git_material(Path::new(&record.workspace));
+                        let observed_material_identity =
+                            material_observation_identity(&observed_material);
+                        let checkpoint_generation =
+                            upgrade_store.observe_checkpoint_generation(&state.request)?;
+                        state.reconcile_successor_after_recovery(
+                            executor_instance_id.clone(),
+                            grant.generation.token.clone(),
+                            Some(&implementation_revision),
+                            observed_material_identity.as_deref(),
+                            Some(checkpoint_generation),
+                        )
+                    })(),
+                    _ => Err(anyhow!("D_SUCCESSOR_RECOVERY_OR_CUSTODY_FAILED")),
+                };
+                if let Err(error) = reconcile {
+                    if let Some(grant) = custody_grants.remove(&execution_id) {
+                        let _ = custody_provider.release(&grant);
+                    }
+                    if let Some(record) = records.get_mut(&execution_id) {
+                        record.runnability = SessionRunnability::Quarantined;
+                        record.custody_assessment = Some(not_held_custody());
+                        let session_dir = session_root.join(&execution_id);
+                        write_record(&session_dir, record)?;
+                    }
+                    state.mark_failed(error.to_string());
+                }
+                upgrade_store.save(state)?;
+            }
+        }
         Ok(Self {
             session_root,
             worktree_root,
@@ -346,7 +414,169 @@ impl ProjectExecutorSupervisor {
             managers: Mutex::new(managers),
             custody_provider: Mutex::new(custody_provider),
             custody_grants: Mutex::new(custody_grants),
+            upgrade_store,
+            upgrade_state: StdMutex::new(upgrade_state),
+            admission_gate: RwLock::new(()),
         })
+    }
+
+    pub fn inspect_transactional_upgrade(&self) -> Option<TransactionalUpgradeState> {
+        self.upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned")
+            .clone()
+    }
+
+    pub async fn prepare_transactional_upgrade(
+        &self,
+        execution_id: &str,
+        attempt_id: &str,
+        expected_successor_revision: &str,
+        checkpoint_generation: u64,
+    ) -> Result<TransactionalUpgradeState> {
+        validate_sha(expected_successor_revision, "expected_successor_revision")?;
+        if attempt_id.is_empty() {
+            bail!("attempt_id must not be empty");
+        }
+        let _admission_barrier = self.admission_gate.write().await;
+        let prior_upgrade = self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned")
+            .clone();
+        if let Some(prior) = prior_upgrade.as_ref() {
+            match prior.phase {
+                UpgradePhase::Complete => {
+                    if checkpoint_generation != prior.request.checkpoint_generation {
+                        bail!("D_CHECKPOINT_PREPARE_MISMATCH");
+                    }
+                    self.upgrade_store.archive_completed(prior)?;
+                }
+                UpgradePhase::Failed => {
+                    bail!("D_TRANSACTION_RECONCILIATION_REQUIRED");
+                }
+                _ => bail!("D_TRANSACTION_ALREADY_EXISTS"),
+            }
+        }
+        let mut record = self.record(execution_id).await?;
+        if record.lifecycle != SessionLifecycle::Ready
+            || record.runnability != SessionRunnability::Runnable
+        {
+            bail!("D_EXECUTION_NOT_RUNNABLE");
+        }
+        let workspace = PathBuf::from(&record.workspace);
+        let grant = self
+            .custody_grants
+            .lock()
+            .await
+            .get(execution_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("D_PREDECESSOR_CUSTODY_NOT_CURRENT"))?;
+        {
+            let provider = self.custody_provider.lock().await;
+            validate_effect_time_custody(
+                &provider,
+                &grant,
+                execution_id,
+                &workspace,
+                &self.executor_instance_id,
+            )?;
+        }
+        let scope = custody_scope(execution_id, &workspace)?;
+        let request = TransactionalUpgradeRequest::new(
+            new_transaction_id(),
+            record.work_identity.clone(),
+            attempt_id,
+            execution_id,
+            scope.collision_identity,
+            self.executor_instance_id.clone(),
+            grant.generation.token.clone(),
+            self.implementation_revision.clone(),
+            expected_successor_revision,
+            material_identity(&record.expected_material),
+            checkpoint_generation,
+        )?;
+        let mut state = TransactionalUpgradeState::new(request);
+        state.quiesce()?;
+        *self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned") = Some(state.clone());
+
+        if let Some(manager) = self.managers.lock().await.get(execution_id).cloned() {
+            if let Err(error) = manager.close_all().await {
+                state.mark_failed(format!("D_QUIESCE_FAILED: {error}"));
+                self.upgrade_store.save(&state)?;
+                *self
+                    .upgrade_state
+                    .lock()
+                    .expect("transactional upgrade mutex poisoned") = Some(state);
+                return Err(error).context("D_QUIESCE_FAILED");
+            }
+        }
+        state.persist_transition()?;
+        self.upgrade_store.save(&state)?;
+        self.upgrade_store.persist_checkpoint(&state.request)?;
+        *self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned") = Some(state.clone());
+
+        if let Err(error) = self.custody_provider.lock().await.release(&grant) {
+            return Err(error).context("D_PREDECESSOR_RELEASE_FAILED");
+        }
+        self.custody_grants.lock().await.remove(execution_id);
+        record.custody_assessment = Some(not_held_custody());
+        durable_write_json(
+            &self.session_root.join(execution_id).join("session.json"),
+            &record,
+        )?;
+        self.records
+            .lock()
+            .await
+            .insert(execution_id.to_owned(), record);
+        state.release_predecessor_generation()?;
+        self.upgrade_store.save(&state)?;
+        *self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned") = Some(state.clone());
+        Ok(state)
+    }
+
+    pub fn resume_transactional_upgrade(
+        &self,
+        intent: ResumeIntent,
+        external_event_payload: &str,
+    ) -> Result<TransactionalUpgradeState> {
+        let mut guard = self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned");
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("D_TRANSACTION_NOT_FOUND"))?;
+        state.accept_resume_durably(&self.upgrade_store, &intent, external_event_payload)?;
+        Ok(state.clone())
+    }
+
+    fn ensure_transactional_admissions_open(&self) -> Result<()> {
+        if let Some(state) = self
+            .upgrade_state
+            .lock()
+            .expect("transactional upgrade mutex poisoned")
+            .as_ref()
+            && !state.admissions_open
+        {
+            bail!("D_ADMISSIONS_QUIESCED");
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn transactional_upgrade_fixture()
+    -> crate::transactional_upgrade::TransactionalUpgradeHarness {
+        crate::transactional_upgrade::TransactionalUpgradeHarness::fixture()
     }
 
     pub fn recovery_summary(&self) -> &RecoverySummary {
@@ -435,6 +665,8 @@ impl ProjectExecutorSupervisor {
     }
 
     pub async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionInspection> {
+        let _admission_guard = self.admission_gate.read().await;
+        self.ensure_transactional_admissions_open()?;
         Uuid::parse_str(&request.execution_id).context("execution_id must be a UUID")?;
         if request.work_identity.is_empty() {
             bail!("work_identity must not be empty");
@@ -716,6 +948,8 @@ impl ProjectExecutorSupervisor {
         cwd: Option<String>,
         authorization_digest: Option<String>,
     ) -> Result<ExecutionProcessRef> {
+        let _admission_guard = self.admission_gate.read().await;
+        self.ensure_transactional_admissions_open()?;
         let manager = self.manager(execution_id).await?;
         let record = self.record(execution_id).await?;
         let binding = record_binding(&record)?;
@@ -788,6 +1022,8 @@ impl ProjectExecutorSupervisor {
     }
 
     pub async fn close_session(&self, execution_id: &str) -> Result<SessionInspection> {
+        let _admission_guard = self.admission_gate.read().await;
+        self.ensure_transactional_admissions_open()?;
         let mut record = self.record(execution_id).await?;
         if record.lifecycle == SessionLifecycle::Closed {
             if custody_release_unresolved(&record) {
@@ -858,6 +1094,8 @@ impl ProjectExecutorSupervisor {
     }
 
     pub async fn retire_workspace(&self, intent: RetirementIntent) -> Result<RetirementReceipt> {
+        let _admission_guard = self.admission_gate.read().await;
+        self.ensure_transactional_admissions_open()?;
         Uuid::parse_str(&intent.execution_id).context("execution_id must be a UUID")?;
         validate_retirement_intent_id(&intent.retirement_intent_id)?;
         let session_dir = self.session_root.join(&intent.execution_id);
@@ -1499,6 +1737,36 @@ fn exact_binding_matches(binding: &WorktreeBinding, workspace: &Path) -> bool {
         return false;
     };
     observed == expected
+}
+
+fn pending_upgrade_targets(state: Option<&TransactionalUpgradeState>, execution_id: &str) -> bool {
+    state
+        .filter(|state| {
+            state.phase != UpgradePhase::Complete && state.phase != UpgradePhase::Failed
+        })
+        .map(|state| state.request.execution_id == execution_id)
+        .unwrap_or(false)
+}
+
+fn recovery_revision_matches(
+    state: Option<&TransactionalUpgradeState>,
+    record: &SessionRecord,
+    observed_revision: &str,
+) -> bool {
+    let Some(state) = state.filter(|state| state.request.execution_id == record.execution_id)
+    else {
+        return record.implementation_revision == observed_revision;
+    };
+    match state.phase {
+        UpgradePhase::Failed => false,
+        UpgradePhase::Complete => record.implementation_revision == observed_revision,
+        _ => {
+            observed_revision == state.request.expected_successor_runtime_identity
+                && (record.implementation_revision == state.request.predecessor_runtime_identity
+                    || record.implementation_revision
+                        == state.request.expected_successor_runtime_identity)
+        }
+    }
 }
 
 fn recovery_receipt(
