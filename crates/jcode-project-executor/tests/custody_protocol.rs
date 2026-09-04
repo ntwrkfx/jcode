@@ -113,3 +113,28 @@ fn effect_is_bound_to_execution_and_collision_scope_at_effect_time() {
     provider.release(&grant).unwrap();
     assert!(provider.validate_effect(&prior).is_err());
 }
+
+#[test]
+fn concurrent_same_scope_acquire_is_rejected_until_current_grant_is_released() {
+    let root = tempfile::tempdir().unwrap();
+    let mut provider = LocalCustodyProvider::new("TEST_LOCAL_FLOCK", root.path()).unwrap();
+    let g1 = acquire(&mut provider, "executor-A");
+    assert!(provider
+        .acquire(CustodyAcquireRequest {
+            scope: scope(),
+            executor_instance_id: "executor-B".to_owned(),
+        })
+        .is_err());
+    assert!(provider.validate_effect(&claim(&g1)).is_ok());
+}
+
+#[test]
+fn stale_release_cannot_revoke_successor_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let mut provider = LocalCustodyProvider::new("TEST_LOCAL_FLOCK", root.path()).unwrap();
+    let g1 = acquire(&mut provider, "executor-A");
+    provider.release(&g1).unwrap();
+    let g2 = acquire(&mut provider, "executor-B");
+    assert!(provider.release(&g1).is_err());
+    assert!(provider.validate_effect(&claim(&g2)).is_ok());
+}
