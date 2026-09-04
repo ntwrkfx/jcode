@@ -204,6 +204,17 @@ fn supervisor_restart_recovers_ready_session_catalog() {
     assert_eq!(inspected["result"]["execution_id"], id);
     assert_eq!(inspected["result"]["head_sha"], sha);
     assert_eq!(inspected["result"]["state"], "READY");
+    assert_eq!(inspected["result"]["runnability"], "QUARANTINED");
+    let health = send(
+        &socket,
+        json!({
+            "protocol": "project-executor/v1", "id": "health2",
+            "command": {"op": "health"}
+        }),
+    );
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["result"]["service"]["state"], "SERVING");
+    assert_eq!(health["result"]["recovery"]["state"], "DEGRADED");
     let process = send(
         &socket,
         json!({
@@ -212,25 +223,13 @@ fn supervisor_restart_recovers_ready_session_catalog() {
                 "argv": ["printf", "recovered"]}
         }),
     );
-    assert_eq!(process["ok"], true);
-    let process_id = process["result"]["process_id"].as_str().unwrap().to_owned();
-    let waited = send(
-        &socket,
-        json!({
-            "protocol": "project-executor/v1", "id": "wait2",
-            "command": {"op": "process_wait", "execution_id": id,
-                "process_id": process_id, "timeout_seconds": 1.0}
-        }),
+    assert_eq!(process["ok"], false);
+    assert!(
+        process["error"]
+            .as_str()
+            .unwrap()
+            .contains("execution is not runnable")
     );
-    assert_eq!(waited["ok"], true);
-    let closed = send(
-        &socket,
-        json!({
-            "protocol": "project-executor/v1", "id": "close2",
-            "command": {"op": "session_close", "execution_id": id}
-        }),
-    );
-    assert_eq!(closed["ok"], true);
     second.kill().unwrap();
     second.wait().unwrap();
 }

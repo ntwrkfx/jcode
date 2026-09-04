@@ -129,7 +129,7 @@ impl ProjectExecutorSupervisor {
         let executor_instance_id = Uuid::new_v4().to_string();
         let mut records = HashMap::new();
         let mut managers = HashMap::new();
-        let mut locks = HashMap::new();
+        let locks = HashMap::new();
         let mut receipts = Vec::new();
         let mut unidentified_failures = 0usize;
         let mut session_dirs = Vec::new();
