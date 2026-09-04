@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SESSION_SCHEMA_VERSION: &str = "project-executor-session/v1";
+pub const SESSION_SCHEMA_VERSION: &str = "project-executor-session/v2";
 pub const WORKTREE_BINDING_SCHEMA_VERSION: &str = "worktree-binding/v1";
 pub const WORKTREE_INSPECTION_SCHEMA_VERSION: &str = "worktree-inspection/v1";
 pub const PROVIDER_NAME: &str = "project-executor";
@@ -8,10 +8,71 @@ pub const IMPLEMENTATION_NAME: &str = "jcode-derived-executor/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SessionState {
+pub enum SessionLifecycle {
     Ready,
     Closed,
     Failed,
+}
+
+pub type SessionState = SessionLifecycle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionRunnability {
+    Runnable,
+    Quarantined,
+    FailedRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkspaceOrigin {
+    Managed,
+    External,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LocalMaterialState {
+    None,
+    Present,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedMaterial {
+    pub head_sha: String,
+    pub local_material: LocalMaterialState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CustodyState {
+    Confirmed,
+    NotHeld,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustodyGenerationEvidence {
+    pub provider: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustodyAssessment {
+    pub state: CustodyState,
+    pub assessed_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<CustodyGenerationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +153,12 @@ pub struct SessionRecord {
     pub workspace: String,
     #[serde(default)]
     pub worktree_binding: Option<WorktreeBinding>,
-    pub state: SessionState,
+    pub lifecycle: SessionLifecycle,
+    pub runnability: SessionRunnability,
+    pub workspace_origin: WorkspaceOrigin,
+    pub expected_material: ExpectedMaterial,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_assessment: Option<CustodyAssessment>,
     pub created_at: u64,
     pub closed_at: Option<u64>,
 }
@@ -111,7 +177,11 @@ pub struct SessionInspection {
     pub branch: String,
     pub workspace: String,
     pub worktree_binding: WorktreeBinding,
-    pub state: SessionState,
+    pub state: SessionLifecycle,
+    pub lifecycle: SessionLifecycle,
+    pub runnability: SessionRunnability,
+    pub workspace_origin: WorkspaceOrigin,
+    pub custody_assessment: Option<CustodyAssessment>,
     pub created_at: u64,
     pub closed_at: Option<u64>,
     pub head_sha: String,

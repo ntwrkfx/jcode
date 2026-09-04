@@ -101,9 +101,19 @@ async fn handle_inner(
         ExecutorCommand::SessionClose { execution_id } => {
             Ok(to_value(supervisor.close_session(&execution_id).await?)?)
         }
-        ExecutorCommand::Health => Ok(json!({
-            "protocol": EXECUTOR_PROTOCOL_VERSION,
-            "status": "ready"
-        })),
+        ExecutorCommand::Health => {
+            let recovery = supervisor.recovery_summary();
+            Ok(json!({
+                "protocol": EXECUTOR_PROTOCOL_VERSION,
+                "status": "ready",
+                "service": {"state": "SERVING"},
+                "recovery": {
+                    "state": recovery.health,
+                    "runnable": recovery.runnable,
+                    "quarantined": recovery.quarantined,
+                    "failed_recovery": recovery.failed_recovery
+                }
+            }))
+        }
     }
 }

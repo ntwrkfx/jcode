@@ -1,11 +1,17 @@
 use crate::process::{
     ExecutionProcessManager, ExecutionProcessOutput, ExecutionProcessRef, ExecutionProcessState,
 };
+use crate::recovery::{
+    RECOVERY_RECEIPT_SCHEMA_VERSION, RecoveryEvidence, RecoveryHealth, RecoveryReasonCode,
+    RecoverySummary, SessionRecoveryReceipt, decode_session_record, derive_runnability,
+    observe_git_material, summarize_recovery, unknown_custody,
+};
 use crate::session::{
-    AccessMode, IMPLEMENTATION_NAME, PROVIDER_NAME, SESSION_SCHEMA_VERSION, SessionCreateRequest,
-    SessionInspection, SessionRecord, SessionState, WORKTREE_BINDING_SCHEMA_VERSION,
-    WORKTREE_INSPECTION_SCHEMA_VERSION, WorktreeBinding, WorktreeInspection, WorktreeMode,
-    WorktreeOwnership,
+    AccessMode, CustodyAssessment, CustodyGenerationEvidence, CustodyState, ExpectedMaterial,
+    IMPLEMENTATION_NAME, LocalMaterialState, PROVIDER_NAME, SESSION_SCHEMA_VERSION,
+    SessionCreateRequest, SessionInspection, SessionLifecycle, SessionRecord, SessionRunnability,
+    WORKTREE_BINDING_SCHEMA_VERSION, WORKTREE_INSPECTION_SCHEMA_VERSION, WorkspaceOrigin,
+    WorktreeBinding, WorktreeInspection, WorktreeMode, WorktreeOwnership,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeSet, HashMap};
@@ -51,6 +57,8 @@ pub struct ProjectExecutorSupervisor {
     lock_root: PathBuf,
     implementation_revision: String,
     device_id: Option<String>,
+    executor_instance_id: String,
+    recovery_summary: RecoverySummary,
     records: Mutex<HashMap<String, SessionRecord>>,
     managers: Mutex<HashMap<String, Arc<ExecutionProcessManager>>>,
     locks: Mutex<HashMap<String, WorktreeWriteLock>>,
@@ -118,9 +126,13 @@ impl ProjectExecutorSupervisor {
         std::fs::create_dir_all(&lock_root).context("create project executor lock root")?;
         let implementation_revision = implementation_revision.into();
         validate_sha(&implementation_revision, "implementation_revision")?;
+        let executor_instance_id = Uuid::new_v4().to_string();
         let mut records = HashMap::new();
         let mut managers = HashMap::new();
         let mut locks = HashMap::new();
+        let mut receipts = Vec::new();
+        let mut unidentified_failures = 0usize;
+        let mut session_dirs = Vec::new();
         for entry in
             std::fs::read_dir(&session_root).context("read project executor session root")?
         {
@@ -128,51 +140,189 @@ impl ProjectExecutorSupervisor {
             if !entry.file_type()?.is_dir() || entry.file_name() == ".worktree-locks" {
                 continue;
             }
-            let record_path = entry.path().join("session.json");
-            if !record_path.is_file() {
+            if entry.path().join("session.json").is_file() {
+                session_dirs.push(entry.path());
+            }
+        }
+        session_dirs.sort();
+
+        for session_dir in session_dirs {
+            let record_path = session_dir.join("session.json");
+            let raw: serde_json::Value = match serde_json::from_str(
+                &std::fs::read_to_string(&record_path).context("read session record")?,
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    unidentified_failures += 1;
+                    continue;
+                }
+            };
+            let decoded = match decode_session_record(raw) {
+                Ok(value) => value,
+                Err(_) => {
+                    unidentified_failures += 1;
+                    continue;
+                }
+            };
+            let translated_from_legacy = decoded.translated_from_legacy;
+            let schema_understood = decoded.schema_understood;
+            let initial_reason_codes = decoded.initial_reason_codes;
+            let mut record = decoded.record;
+            if record.lifecycle != SessionLifecycle::Ready {
+                records.insert(record.execution_id.clone(), record);
                 continue;
             }
-            let mut record: SessionRecord = serde_json::from_str(
-                &std::fs::read_to_string(&record_path).context("read session record")?,
-            )
-            .context("parse session record")?;
-            if record.schema_version != SESSION_SCHEMA_VERSION {
-                bail!("unsupported session schema: {}", record.schema_version);
+
+            let workspace = PathBuf::from(&record.workspace);
+            let observed_material = observe_git_material(&workspace);
+            if !schema_understood {
+                record.runnability = SessionRunnability::Quarantined;
+                record.custody_assessment = Some(unknown_custody());
+                let receipt = recovery_receipt(
+                    &record,
+                    &implementation_revision,
+                    workspace.is_dir().then(|| record.workspace.clone()),
+                    observed_material,
+                    record
+                        .custody_assessment
+                        .clone()
+                        .unwrap_or_else(unknown_custody),
+                    SessionRunnability::Quarantined,
+                    initial_reason_codes,
+                );
+                write_recovery_receipt(&session_dir, &executor_instance_id, &receipt)?;
+                receipts.push(receipt);
+                records.insert(record.execution_id.clone(), record);
+                continue;
             }
-            if record.worktree_binding.is_none() {
-                record.worktree_binding = Some(legacy_managed_binding(&record));
-                write_record(&entry.path(), &record)?;
+            if !workspace.is_dir() {
+                record.runnability = SessionRunnability::FailedRecovery;
+                record.custody_assessment = Some(not_held_custody());
+                write_record(&session_dir, &record)?;
+                let receipt = recovery_receipt(
+                    &record,
+                    &implementation_revision,
+                    None,
+                    observed_material,
+                    record
+                        .custody_assessment
+                        .clone()
+                        .unwrap_or_else(unknown_custody),
+                    SessionRunnability::FailedRecovery,
+                    vec![RecoveryReasonCode::ReadyWorkspaceMissing],
+                );
+                write_recovery_receipt(&session_dir, &executor_instance_id, &receipt)?;
+                receipts.push(receipt);
+                records.insert(record.execution_id.clone(), record);
+                continue;
             }
-            if record.state == SessionState::Ready {
-                if record.implementation_revision != implementation_revision {
-                    records.insert(record.execution_id.clone(), record);
-                    continue;
+
+            if translated_from_legacy {
+                record.runnability = SessionRunnability::Quarantined;
+                record.custody_assessment = Some(unknown_custody());
+                let receipt = recovery_receipt(
+                    &record,
+                    &implementation_revision,
+                    Some(record.workspace.clone()),
+                    observed_material,
+                    record
+                        .custody_assessment
+                        .clone()
+                        .unwrap_or_else(unknown_custody),
+                    SessionRunnability::Quarantined,
+                    initial_reason_codes,
+                );
+                write_recovery_receipt(&session_dir, &executor_instance_id, &receipt)?;
+                receipts.push(receipt);
+                records.insert(record.execution_id.clone(), record);
+                continue;
+            }
+
+            let binding = record_binding(&record)?;
+            let binding_matches = exact_binding_matches(&binding, &workspace);
+            let material_sufficiently_known = record.expected_material.local_material
+                == LocalMaterialState::None
+                && observed_material.local_material != LocalMaterialState::Unknown;
+            let material_matches = observed_material.head_sha.as_deref()
+                == Some(record.expected_material.head_sha.as_str())
+                && observed_material.local_material == record.expected_material.local_material;
+            let write_required = binding.access_mode == AccessMode::Write;
+            let mut acquired_lock = None;
+            let custody = if record.implementation_revision != implementation_revision {
+                unknown_custody()
+            } else if write_required {
+                match WorktreeWriteLock::acquire(&lock_root, &workspace) {
+                    Ok(lock) => {
+                        let assessment = confirmed_custody(&executor_instance_id, &workspace);
+                        acquired_lock = Some(lock);
+                        assessment
+                    }
+                    Err(error) if error.to_string().contains("WORKTREE_BUSY") => not_held_custody(),
+                    Err(_) => unknown_custody(),
                 }
-                let binding = record_binding(&record)?;
-                let workspace = PathBuf::from(&record.workspace);
-                if !workspace.is_dir() {
-                    record_recovery_quarantine(
-                        &entry.path(),
-                        &mut record,
-                        "READY_WORKSPACE_MISSING",
-                    )?;
-                    records.insert(record.execution_id.clone(), record);
-                    continue;
-                }
-                if binding.access_mode == AccessMode::Write {
-                    locks.insert(
-                        record.execution_id.clone(),
-                        WorktreeWriteLock::acquire(&lock_root, &workspace)?,
-                    );
-                }
-                let manager = ExecutionProcessManager::create_with_state_root_and_access(
+            } else {
+                unknown_custody()
+            };
+            let evidence = RecoveryEvidence {
+                lifecycle: record.lifecycle,
+                workspace_origin: record.workspace_origin,
+                schema_understood: true,
+                revision_matches: record.implementation_revision == implementation_revision,
+                binding_matches,
+                material_matches,
+                material_sufficiently_known,
+                custody: custody.clone(),
+                current_executor_instance_id: executor_instance_id.clone(),
+                write_custody_required: write_required,
+            };
+            let mut decision = derive_runnability(&evidence);
+            if write_required && custody.state == CustodyState::NotHeld {
+                decision.reason_codes = vec![RecoveryReasonCode::CustodyContention];
+            }
+            if decision.result == SessionRunnability::Runnable {
+                match ExecutionProcessManager::create_with_state_root_and_access(
                     &workspace,
-                    entry.path().join("evidence"),
-                    binding.access_mode == AccessMode::Write,
-                )?;
-                managers.insert(record.execution_id.clone(), Arc::new(manager));
+                    session_dir.join("evidence"),
+                    write_required,
+                ) {
+                    Ok(manager) => {
+                        managers.insert(record.execution_id.clone(), Arc::new(manager));
+                        if let Some(lock) = acquired_lock.take() {
+                            locks.insert(record.execution_id.clone(), lock);
+                        }
+                    }
+                    Err(_) => {
+                        decision.result = SessionRunnability::Quarantined;
+                        decision.reason_codes = vec![RecoveryReasonCode::RecoveryProbeFailed];
+                    }
+                }
             }
+            drop(acquired_lock);
+            record.runnability = decision.result;
+            record.custody_assessment = Some(custody.clone());
+            write_record(&session_dir, &record)?;
+            let receipt = recovery_receipt(
+                &record,
+                &implementation_revision,
+                Some(record.workspace.clone()),
+                observed_material,
+                custody,
+                decision.result,
+                decision.reason_codes,
+            );
+            write_recovery_receipt(&session_dir, &executor_instance_id, &receipt)?;
+            receipts.push(receipt);
             records.insert(record.execution_id.clone(), record);
+        }
+        let mut recovery_summary = summarize_recovery(receipts);
+        if unidentified_failures > 0 {
+            recovery_summary.failed_recovery += unidentified_failures;
+            recovery_summary.health =
+                if recovery_summary.runnable == 0 && recovery_summary.quarantined == 0 {
+                    RecoveryHealth::Failed
+                } else {
+                    RecoveryHealth::Degraded
+                };
         }
         Ok(Self {
             session_root,
@@ -180,10 +330,20 @@ impl ProjectExecutorSupervisor {
             lock_root,
             implementation_revision,
             device_id,
+            executor_instance_id,
+            recovery_summary,
             records: Mutex::new(records),
             managers: Mutex::new(managers),
             locks: Mutex::new(locks),
         })
+    }
+
+    pub fn recovery_summary(&self) -> &RecoverySummary {
+        &self.recovery_summary
+    }
+
+    pub fn executor_instance_id(&self) -> &str {
+        &self.executor_instance_id
     }
 
     pub async fn list_worktrees(&self) -> Result<Vec<WorktreeInspection>> {
@@ -240,7 +400,8 @@ impl ProjectExecutorSupervisor {
     async fn writer_for_path(&self, path: &Path) -> Result<Option<String>> {
         let active_writers = self.locks.lock().await.keys().cloned().collect::<Vec<_>>();
         for record in self.records.lock().await.values() {
-            if record.state != SessionState::Ready || !active_writers.contains(&record.execution_id)
+            if record.lifecycle != SessionLifecycle::Ready
+                || !active_writers.contains(&record.execution_id)
             {
                 continue;
             }
@@ -405,11 +566,22 @@ impl ProjectExecutorSupervisor {
             work_identity: request.work_identity,
             repository: request.repository,
             repository_path: repository_path.display().to_string(),
-            base_sha: request.base_sha,
+            base_sha: request.base_sha.clone(),
             branch: session_branch,
             workspace: workspace.display().to_string(),
             worktree_binding: Some(binding),
-            state: SessionState::Ready,
+            lifecycle: SessionLifecycle::Ready,
+            runnability: SessionRunnability::Runnable,
+            workspace_origin: if managed_created {
+                WorkspaceOrigin::Managed
+            } else {
+                WorkspaceOrigin::External
+            },
+            expected_material: ExpectedMaterial {
+                head_sha: request.base_sha.clone(),
+                local_material: LocalMaterialState::None,
+            },
+            custody_assessment: None,
             created_at: now_millis()?,
             closed_at: None,
         };
@@ -434,21 +606,23 @@ impl ProjectExecutorSupervisor {
     pub async fn inspect_session(&self, execution_id: &str) -> Result<SessionInspection> {
         let record = self.record(execution_id).await?;
         let mut binding = record_binding(&record)?;
-        let (head_sha, clean) = if record.state == SessionState::Ready {
-            let workspace = PathBuf::from(&record.workspace);
-            if !workspace.is_dir() {
-                bail!("session workspace is missing: {}", workspace.display());
-            }
+        let workspace = PathBuf::from(&record.workspace);
+        let (head_sha, clean) = if workspace.is_dir() {
             if let Some(device_id) = &self.device_id {
                 binding.device_id = Some(device_id.clone());
-                binding.git_common_dir = Some(git_common_dir(&workspace)?.display().to_string());
+                if let Ok(common_dir) = git_common_dir(&workspace) {
+                    binding.git_common_dir = Some(common_dir.display().to_string());
+                }
             }
+            let observed = observe_git_material(&workspace);
             (
-                git(&workspace, &["rev-parse", "HEAD"])?,
-                git(&workspace, &["status", "--porcelain"])?.is_empty(),
+                observed
+                    .head_sha
+                    .unwrap_or_else(|| record.expected_material.head_sha.clone()),
+                observed.local_material == LocalMaterialState::None,
             )
         } else {
-            (record.base_sha.clone(), true)
+            (record.expected_material.head_sha.clone(), false)
         };
         Ok(SessionInspection {
             schema_version: record.schema_version,
@@ -463,7 +637,11 @@ impl ProjectExecutorSupervisor {
             branch: record.branch,
             workspace: record.workspace,
             worktree_binding: binding,
-            state: record.state,
+            state: record.lifecycle,
+            lifecycle: record.lifecycle,
+            runnability: record.runnability,
+            workspace_origin: record.workspace_origin,
+            custody_assessment: record.custody_assessment,
             created_at: record.created_at,
             closed_at: record.closed_at,
             head_sha,
@@ -522,7 +700,7 @@ impl ProjectExecutorSupervisor {
 
     pub async fn close_session(&self, execution_id: &str) -> Result<SessionInspection> {
         let mut record = self.record(execution_id).await?;
-        if record.state == SessionState::Closed {
+        if record.lifecycle == SessionLifecycle::Closed {
             return self.inspect_session(execution_id).await;
         }
         if let Some(manager) = self.managers.lock().await.get(execution_id).cloned() {
@@ -537,7 +715,8 @@ impl ProjectExecutorSupervisor {
             remove_managed_worktree(Path::new(&record.repository_path), &workspace)?;
         }
         self.locks.lock().await.remove(execution_id);
-        record.state = SessionState::Closed;
+        record.lifecycle = SessionLifecycle::Closed;
+        record.runnability = SessionRunnability::Quarantined;
         record.closed_at = Some(now_millis()?);
         write_record(&self.session_root.join(execution_id), &record)?;
         self.records
@@ -559,11 +738,14 @@ impl ProjectExecutorSupervisor {
 
     async fn manager(&self, execution_id: &str) -> Result<Arc<ExecutionProcessManager>> {
         let record = self.record(execution_id).await?;
-        if record.state == SessionState::Closed {
+        if record.lifecycle == SessionLifecycle::Closed {
             bail!("execution is closed: {execution_id}");
         }
-        if record.state != SessionState::Ready {
+        if record.lifecycle != SessionLifecycle::Ready {
             bail!("execution is not ready: {execution_id}");
+        }
+        if record.runnability != SessionRunnability::Runnable {
+            bail!("execution is not runnable: {execution_id}");
         }
         self.managers
             .lock()
@@ -774,28 +956,76 @@ fn now_millis() -> Result<u64> {
     u64::try_from(millis).context("timestamp does not fit u64")
 }
 
-fn record_recovery_quarantine(
+fn confirmed_custody(executor_instance_id: &str, workspace: &Path) -> CustodyAssessment {
+    CustodyAssessment {
+        state: CustodyState::Confirmed,
+        assessed_at: now_millis().unwrap_or(0),
+        executor_instance_id: Some(executor_instance_id.to_owned()),
+        generation: Some(CustodyGenerationEvidence {
+            provider: "PROJECT_EXECUTOR_FENCE".to_owned(),
+            token: format!("{executor_instance_id}:{:016x}", stable_path_key(workspace)),
+        }),
+        evidence_ref: None,
+    }
+}
+
+fn not_held_custody() -> CustodyAssessment {
+    CustodyAssessment {
+        state: CustodyState::NotHeld,
+        assessed_at: now_millis().unwrap_or(0),
+        executor_instance_id: None,
+        generation: None,
+        evidence_ref: None,
+    }
+}
+
+fn exact_binding_matches(binding: &WorktreeBinding, workspace: &Path) -> bool {
+    let Ok(observed) = workspace.canonicalize() else {
+        return false;
+    };
+    let Ok(expected) = PathBuf::from(&binding.path).canonicalize() else {
+        return false;
+    };
+    observed == expected
+}
+
+fn recovery_receipt(
+    record: &SessionRecord,
+    observed_executor_revision: &str,
+    observed_workspace: Option<String>,
+    observed_material: crate::recovery::MaterialObservation,
+    custody: CustodyAssessment,
+    result: SessionRunnability,
+    reason_codes: Vec<RecoveryReasonCode>,
+) -> SessionRecoveryReceipt {
+    SessionRecoveryReceipt {
+        schema_version: RECOVERY_RECEIPT_SCHEMA_VERSION.to_owned(),
+        session_id: record.execution_id.clone(),
+        expected_executor_revision: record.implementation_revision.clone(),
+        observed_executor_revision: observed_executor_revision.to_owned(),
+        expected_workspace: record.workspace.clone(),
+        observed_workspace,
+        expected_material: record.expected_material.clone(),
+        observed_at: observed_material.observed_at,
+        observed_material,
+        custody,
+        result,
+        reason_codes,
+    }
+}
+
+fn write_recovery_receipt(
     session_dir: &Path,
-    record: &mut SessionRecord,
-    reason: &str,
+    executor_instance_id: &str,
+    receipt: &SessionRecoveryReceipt,
 ) -> Result<()> {
-    record.state = SessionState::Failed;
-    write_record(session_dir, record)?;
-    let evidence_dir = session_dir.join("evidence");
-    std::fs::create_dir_all(&evidence_dir).context("create recovery evidence directory")?;
-    let target = evidence_dir.join("recovery-quarantine.json");
-    let temporary = evidence_dir.join("recovery-quarantine.json.tmp");
-    let payload = serde_json::json!({
-        "schema_version": "project-executor-recovery-quarantine/v1",
-        "execution_id": record.execution_id,
-        "implementation_revision": record.implementation_revision,
-        "workspace": record.workspace,
-        "reason": reason,
-        "state": "FAILED",
-    });
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&payload)?)
-        .context("write recovery quarantine evidence")?;
-    std::fs::rename(&temporary, &target).context("commit recovery quarantine evidence")?;
+    let root = session_dir.join("evidence/recovery");
+    std::fs::create_dir_all(&root).context("create recovery receipt directory")?;
+    let target = root.join(format!("{executor_instance_id}.json"));
+    let temporary = root.join(format!("{executor_instance_id}.json.tmp"));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(receipt)?)
+        .context("write recovery receipt")?;
+    std::fs::rename(&temporary, &target).context("commit recovery receipt")?;
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 use jcode_project_executor::{
-    AccessMode, ProjectExecutorSupervisor, SessionCreateRequest, SessionState, WorktreeMode,
-    WorktreeOwnership,
+    AccessMode, ProjectExecutorSupervisor, SessionCreateRequest, SessionRunnability, SessionState,
+    WorktreeMode, WorktreeOwnership,
 };
 use std::path::Path;
 use std::process::Command;
@@ -506,7 +506,10 @@ async fn incompatible_ready_session_is_quarantined_without_deleting_workspace() 
     assert_eq!(inspection.state, SessionState::Ready);
     assert_eq!(inspection.implementation_revision, old_revision);
     assert!(Path::new(&created.workspace).join("preserve.txt").is_file());
-    let discovered = recovered.inspect_worktree(&created.workspace).await.unwrap();
+    let discovered = recovered
+        .inspect_worktree(&created.workspace)
+        .await
+        .unwrap();
     assert_eq!(discovered.writer, None);
 }
 
@@ -555,17 +558,202 @@ async fn matching_ready_missing_workspace_is_recorded_failed_instead_of_aborting
         ProjectExecutorSupervisor::create_with_worktree_root(&sessions, root.path(), revision)
             .unwrap();
     let inspection = recovered.inspect_session(id).await.unwrap();
-    assert_eq!(inspection.state, SessionState::Failed);
+    assert_eq!(inspection.state, SessionState::Ready);
+    assert_eq!(inspection.lifecycle, SessionState::Ready);
+    assert_eq!(inspection.runnability, SessionRunnability::FailedRecovery);
     assert_eq!(inspection.implementation_revision, revision);
 
     let persisted: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(session_dir.join("session.json")).unwrap())
             .unwrap();
-    assert_eq!(persisted["state"], "FAILED");
-    let recovery: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(session_dir.join("evidence/recovery-quarantine.json")).unwrap(),
+    assert_eq!(persisted["schema_version"], "project-executor-session/v2");
+    assert_eq!(persisted["lifecycle"], "READY");
+    assert_eq!(persisted["runnability"], "FAILED_RECOVERY");
+    assert!(persisted.get("state").is_none());
+
+    let receipts_dir = session_dir.join("evidence/recovery");
+    let receipts = std::fs::read_dir(&receipts_dir)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let recovery: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(receipts[0].path()).unwrap()).unwrap();
+    assert_eq!(recovery["schema_version"], "SessionRecoveryReceipt/v1");
+    assert_eq!(recovery["result"], "FAILED_RECOVERY");
+    assert_eq!(
+        recovery["reason_codes"],
+        serde_json::json!(["READY_WORKSPACE_MISSING"])
+    );
+    assert_eq!(recovered.recovery_summary().failed_recovery, 1);
+    let error = recovered
+        .start_process(id, vec!["true".into()], None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("execution is not runnable"));
+}
+
+#[tokio::test]
+async fn recovery_failure_is_isolated_and_receipts_are_sorted() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let revision = "7777777777777777777777777777777777777777";
+
+    let present_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let present_dir = sessions.join(present_id);
+    let present_workspace = present_dir.join("workspace");
+    let present_sha = make_repo(&present_workspace);
+    std::fs::create_dir_all(present_dir.join("evidence")).unwrap();
+    let present = serde_json::json!({
+        "schema_version": "project-executor-session/v1",
+        "execution_id": present_id,
+        "provider": "project-executor",
+        "implementation": "jcode-derived-executor/v1",
+        "implementation_revision": revision,
+        "work_identity": "local:test:present-legacy",
+        "repository": present_workspace,
+        "repository_path": present_workspace,
+        "base_sha": present_sha,
+        "branch": "main",
+        "workspace": present_workspace,
+        "state": "READY",
+        "created_at": 2,
+        "closed_at": null
+    });
+    std::fs::write(
+        present_dir.join("session.json"),
+        serde_json::to_vec_pretty(&present).unwrap(),
     )
     .unwrap();
-    assert_eq!(recovery["reason"], "READY_WORKSPACE_MISSING");
-    assert_eq!(recovery["implementation_revision"], revision);
+
+    let missing_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let missing_dir = sessions.join(missing_id);
+    let missing_workspace = missing_dir.join("workspace");
+    std::fs::create_dir_all(missing_dir.join("evidence")).unwrap();
+    let missing = serde_json::json!({
+        "schema_version": "project-executor-session/v1",
+        "execution_id": missing_id,
+        "provider": "project-executor",
+        "implementation": "jcode-derived-executor/v1",
+        "implementation_revision": revision,
+        "work_identity": "local:test:missing-legacy",
+        "repository": root.path().join("missing-repo"),
+        "repository_path": root.path().join("missing-repo"),
+        "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "branch": "main",
+        "workspace": missing_workspace,
+        "state": "READY",
+        "created_at": 1,
+        "closed_at": null
+    });
+    std::fs::write(
+        missing_dir.join("session.json"),
+        serde_json::to_vec_pretty(&missing).unwrap(),
+    )
+    .unwrap();
+
+    let recovered =
+        ProjectExecutorSupervisor::create_with_worktree_root(&sessions, root.path(), revision)
+            .unwrap();
+    assert_eq!(
+        recovered
+            .inspect_session(missing_id)
+            .await
+            .unwrap()
+            .runnability,
+        SessionRunnability::FailedRecovery
+    );
+    assert_eq!(
+        recovered
+            .inspect_session(present_id)
+            .await
+            .unwrap()
+            .runnability,
+        SessionRunnability::Quarantined
+    );
+    let summary = recovered.recovery_summary();
+    assert_eq!(summary.runnable, 0);
+    assert_eq!(summary.quarantined, 1);
+    assert_eq!(summary.failed_recovery, 1);
+    assert_eq!(
+        summary
+            .receipts
+            .iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![missing_id, present_id]
+    );
+    for id in [missing_id, present_id] {
+        let error = recovered
+            .start_process(id, vec!["true".into()], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("execution is not runnable"));
+    }
+}
+
+#[tokio::test]
+async fn unsupported_schema_with_safe_identity_is_quarantined_and_sibling_survives() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = root.path().join("sessions");
+    let revision = "8888888888888888888888888888888888888888";
+
+    let unsupported_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let unsupported_dir = sessions.join(unsupported_id);
+    let unsupported_workspace = unsupported_dir.join("workspace");
+    let sha = make_repo(&unsupported_workspace);
+    std::fs::create_dir_all(unsupported_dir.join("evidence")).unwrap();
+    let unsupported = serde_json::json!({
+        "schema_version": "project-executor-session/v99",
+        "execution_id": unsupported_id,
+        "provider": "project-executor",
+        "implementation": "jcode-derived-executor/v1",
+        "implementation_revision": revision,
+        "work_identity": "local:test:unsupported",
+        "repository": unsupported_workspace,
+        "repository_path": unsupported_workspace,
+        "base_sha": sha,
+        "branch": "main",
+        "workspace": unsupported_workspace,
+        "state": "READY",
+        "created_at": 1,
+        "closed_at": null
+    });
+    let unsupported_bytes = serde_json::to_vec_pretty(&unsupported).unwrap();
+    std::fs::write(unsupported_dir.join("session.json"), &unsupported_bytes).unwrap();
+
+    let malformed_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let malformed_dir = sessions.join(malformed_id);
+    std::fs::create_dir_all(&malformed_dir).unwrap();
+    std::fs::write(
+        malformed_dir.join("session.json"),
+        r#"{"schema_version":"project-executor-session/v99","state":"READY"}"#,
+    )
+    .unwrap();
+
+    let recovered =
+        ProjectExecutorSupervisor::create_with_worktree_root(&sessions, root.path(), revision)
+            .unwrap();
+    let inspection = recovered.inspect_session(unsupported_id).await.unwrap();
+    assert_eq!(inspection.runnability, SessionRunnability::Quarantined);
+    assert_eq!(inspection.schema_version, "project-executor-session/v99");
+    assert_eq!(
+        std::fs::read(unsupported_dir.join("session.json")).unwrap(),
+        unsupported_bytes
+    );
+    assert!(recovered.inspect_session(malformed_id).await.is_err());
+    let error = recovered
+        .start_process(unsupported_id, vec!["true".into()], None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("execution is not runnable"));
+    let summary = recovered.recovery_summary();
+    assert_eq!(summary.quarantined, 1);
+    assert_eq!(summary.failed_recovery, 1);
+    assert_eq!(summary.receipts.len(), 1);
+    assert_eq!(summary.receipts[0].session_id, unsupported_id);
+    assert_eq!(
+        summary.receipts[0].reason_codes,
+        vec![jcode_project_executor::RecoveryReasonCode::SessionSchemaUnsupported]
+    );
 }

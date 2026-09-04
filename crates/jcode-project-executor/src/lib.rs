@@ -2,6 +2,7 @@
 
 mod process;
 mod protocol;
+mod recovery;
 mod service;
 mod session;
 mod supervisor;
@@ -14,10 +15,17 @@ pub use protocol::{
     ExecutorCommand, ExecutorRequest, ExecutorResponse, WorkerCommand, WorkerRequest,
     WorkerResponse,
 };
+pub use recovery::{
+    DecodedSessionRecord, MaterialObservation, RecoveryDecision, RecoveryEvidence, RecoveryHealth,
+    RecoveryReasonCode, RecoverySummary, SessionRecoveryReceipt, decode_session_record,
+    derive_runnability, observe_git_material, summarize_recovery,
+};
 pub use service::handle_executor_request;
 pub use session::{
-    AccessMode, SessionCreateRequest, SessionInspection, SessionRecord, SessionState,
-    WorktreeBinding, WorktreeInspection, WorktreeMode, WorktreeOwnership,
+    AccessMode, CustodyAssessment, CustodyGenerationEvidence, CustodyState, ExpectedMaterial,
+    LocalMaterialState, SessionCreateRequest, SessionInspection, SessionLifecycle, SessionRecord,
+    SessionRunnability, SessionState, WorkspaceOrigin, WorktreeBinding, WorktreeInspection,
+    WorktreeMode, WorktreeOwnership,
 };
 pub use supervisor::ProjectExecutorSupervisor;
 pub use worker::ExecutionWorker;
