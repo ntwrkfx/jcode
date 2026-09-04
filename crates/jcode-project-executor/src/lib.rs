@@ -1,10 +1,12 @@
 //! Bounded model-less project executor derived from jcode execution mechanics.
 
 pub mod custody;
+mod durable;
 pub mod effect;
 mod process;
 mod protocol;
 mod recovery;
+pub mod retirement;
 mod service;
 mod session;
 mod supervisor;

@@ -1,6 +1,7 @@
 use crate::custody::{
     CustodyAcquireRequest, CustodyEffectClaim, CustodyGrant, CustodyScope, LocalCustodyProvider,
 };
+use crate::durable::durable_write_json;
 use crate::effect::{
     EffectAuthorizationBinding, MaterialAuthorizationClaim, WRITE_PROCESS_EFFECT_CLASS,
     validate_authorization_digest,
@@ -12,6 +13,10 @@ use crate::recovery::{
     RECOVERY_RECEIPT_SCHEMA_VERSION, RecoveryEvidence, RecoveryHealth, RecoveryReasonCode,
     RecoverySummary, SessionRecoveryReceipt, decode_session_record, derive_runnability,
     observe_git_material, summarize_recovery, unknown_custody,
+};
+use crate::retirement::{
+    RETIREMENT_RECEIPT_SCHEMA_VERSION, RetirementIntent, RetirementOutcome, RetirementReasonCode,
+    RetirementReceipt, WORKSPACE_RETIRE_EFFECT_CLASS,
 };
 use crate::session::{
     AccessMode, CustodyAssessment, CustodyState, ExpectedMaterial, IMPLEMENTATION_NAME,
@@ -785,32 +790,291 @@ impl ProjectExecutorSupervisor {
     pub async fn close_session(&self, execution_id: &str) -> Result<SessionInspection> {
         let mut record = self.record(execution_id).await?;
         if record.lifecycle == SessionLifecycle::Closed {
+            if custody_release_unresolved(&record) {
+                bail!("CUSTODY_RELEASE_UNRESOLVED: closed session requires reconciliation");
+            }
             return self.inspect_session(execution_id).await;
         }
         if let Some(manager) = self.managers.lock().await.get(execution_id).cloned() {
             manager.close_all().await?;
         }
-        let binding = record_binding(&record)?;
-        let workspace = PathBuf::from(&record.workspace);
-        if binding.mode == WorktreeMode::Managed
-            && binding.ownership == WorktreeOwnership::Harness
-            && workspace.exists()
-        {
-            remove_managed_worktree(Path::new(&record.repository_path), &workspace)?;
-        }
-        if let Some(grant) = self.custody_grants.lock().await.remove(execution_id) {
-            self.custody_provider.lock().await.release(&grant)?;
-        }
+
+        let current_grant = self.custody_grants.lock().await.get(execution_id).cloned();
         record.lifecycle = SessionLifecycle::Closed;
         record.runnability = SessionRunnability::Quarantined;
         record.closed_at = Some(now_millis()?);
-        write_record(&self.session_root.join(execution_id), &record)?;
+        if current_grant.is_some() {
+            record.custody_assessment = Some(CustodyAssessment {
+                state: CustodyState::Unknown,
+                assessed_at: now_millis()?,
+                executor_instance_id: None,
+                generation: None,
+                evidence_ref: Some("CUSTODY_RELEASE_PENDING".to_owned()),
+            });
+        }
+
+        // C requires CLOSED to reach durable storage before current B custody is released.
+        durable_write_json(
+            &self.session_root.join(execution_id).join("session.json"),
+            &record,
+        )?;
         self.records
             .lock()
             .await
-            .insert(execution_id.to_owned(), record);
+            .insert(execution_id.to_owned(), record.clone());
+
+        if let Some(grant) = current_grant {
+            if let Err(error) = self.custody_provider.lock().await.release(&grant) {
+                record.custody_assessment = Some(CustodyAssessment {
+                    state: CustodyState::Unknown,
+                    assessed_at: now_millis()?,
+                    executor_instance_id: None,
+                    generation: None,
+                    evidence_ref: Some("CUSTODY_RELEASE_UNRESOLVED".to_owned()),
+                });
+                durable_write_json(
+                    &self.session_root.join(execution_id).join("session.json"),
+                    &record,
+                )?;
+                self.records
+                    .lock()
+                    .await
+                    .insert(execution_id.to_owned(), record);
+                return Err(error).context("CUSTODY_RELEASE_UNRESOLVED");
+            }
+            self.custody_grants.lock().await.remove(execution_id);
+            record.custody_assessment = Some(not_held_custody());
+            durable_write_json(
+                &self.session_root.join(execution_id).join("session.json"),
+                &record,
+            )?;
+            self.records
+                .lock()
+                .await
+                .insert(execution_id.to_owned(), record);
+        }
         self.managers.lock().await.remove(execution_id);
         self.inspect_session(execution_id).await
+    }
+
+    pub async fn retire_workspace(&self, intent: RetirementIntent) -> Result<RetirementReceipt> {
+        Uuid::parse_str(&intent.execution_id).context("execution_id must be a UUID")?;
+        validate_retirement_intent_id(&intent.retirement_intent_id)?;
+        let session_dir = self.session_root.join(&intent.execution_id);
+        let receipt_path = retirement_receipt_path(&session_dir, &intent.retirement_intent_id);
+        if receipt_path.is_file() {
+            let receipt: RetirementReceipt = serde_json::from_slice(
+                &std::fs::read(&receipt_path).context("read retirement receipt")?,
+            )?;
+            if receipt.intent != intent {
+                bail!("RETIREMENT_INTENT_REPLAY_MISMATCH");
+            }
+            return Ok(receipt);
+        }
+
+        let record = self.record(&intent.execution_id).await?;
+        let intent_preexisted = persist_retirement_intent(&session_dir, &intent)?;
+
+        if record.lifecycle != SessionLifecycle::Closed {
+            return self
+                .finish_retirement(
+                    &session_dir,
+                    intent,
+                    RetirementOutcome::Denied,
+                    Some(RetirementReasonCode::SessionNotClosed),
+                    None,
+                )
+                .await;
+        }
+        let binding = record_binding(&record)?;
+        if record.workspace_origin != WorkspaceOrigin::Managed
+            || binding.mode != WorktreeMode::Managed
+            || binding.ownership != WorktreeOwnership::Harness
+        {
+            return self
+                .finish_retirement(
+                    &session_dir,
+                    intent,
+                    RetirementOutcome::Denied,
+                    Some(RetirementReasonCode::NotManagedHarness),
+                    None,
+                )
+                .await;
+        }
+        if let Err(reason) = validate_retirement_authorization(&record, &intent) {
+            return self
+                .finish_retirement(
+                    &session_dir,
+                    intent,
+                    RetirementOutcome::Denied,
+                    Some(reason),
+                    None,
+                )
+                .await;
+        }
+
+        let workspace = PathBuf::from(&record.workspace);
+        if !workspace.exists() {
+            let (outcome, reason) = if intent_preexisted {
+                (
+                    RetirementOutcome::OutcomeAmbiguous,
+                    Some(RetirementReasonCode::OutcomeAmbiguous),
+                )
+            } else {
+                (RetirementOutcome::AlreadyAbsentObserved, None)
+            };
+            return self
+                .finish_retirement(&session_dir, intent, outcome, reason, None)
+                .await;
+        }
+
+        let grant = match self
+            .custody_provider
+            .lock()
+            .await
+            .acquire(CustodyAcquireRequest {
+                scope: custody_scope(&record.execution_id, &workspace)?,
+                executor_instance_id: self.executor_instance_id.clone(),
+            }) {
+            Ok(grant) => grant,
+            Err(_) => {
+                return self
+                    .finish_retirement(
+                        &session_dir,
+                        intent,
+                        RetirementOutcome::Denied,
+                        Some(RetirementReasonCode::CustodyNotCurrent),
+                        None,
+                    )
+                    .await;
+            }
+        };
+        let generation = Some(grant.generation.clone());
+
+        let result = self
+            .retire_with_current_grant(&record, &intent, &workspace, &grant)
+            .await;
+        let release_failed = self.custody_provider.lock().await.release(&grant).is_err();
+        let (outcome, reason) = reconcile_retirement_release(result, release_failed);
+        self.finish_retirement(&session_dir, intent, outcome, reason, generation)
+            .await
+    }
+
+    async fn retire_with_current_grant(
+        &self,
+        record: &SessionRecord,
+        intent: &RetirementIntent,
+        workspace: &Path,
+        grant: &CustodyGrant,
+    ) -> (RetirementOutcome, Option<RetirementReasonCode>) {
+        if validate_retirement_authorization(record, intent).is_err() {
+            return (
+                RetirementOutcome::Denied,
+                Some(RetirementReasonCode::ScopeMismatch),
+            );
+        }
+        let custody_current = {
+            let provider = self.custody_provider.lock().await;
+            validate_effect_time_custody(
+                &provider,
+                grant,
+                &record.execution_id,
+                workspace,
+                &self.executor_instance_id,
+            )
+            .is_ok()
+        };
+        if !custody_current {
+            return (
+                RetirementOutcome::Denied,
+                Some(RetirementReasonCode::CustodyNotCurrent),
+            );
+        }
+        let preflight = observe_git_material(workspace);
+        match classify_retirement_material(&preflight, &intent.expected_material) {
+            Ok(()) => {}
+            Err(reason) => return (RetirementOutcome::Denied, Some(reason)),
+        }
+
+        // Revalidate every positive predicate immediately before the destructive effect.
+        if validate_retirement_authorization(record, intent).is_err() {
+            return (
+                RetirementOutcome::Denied,
+                Some(RetirementReasonCode::ScopeMismatch),
+            );
+        }
+        let custody_current = {
+            let provider = self.custody_provider.lock().await;
+            validate_effect_time_custody(
+                &provider,
+                grant,
+                &record.execution_id,
+                workspace,
+                &self.executor_instance_id,
+            )
+            .is_ok()
+        };
+        if !custody_current {
+            return (
+                RetirementOutcome::Denied,
+                Some(RetirementReasonCode::CustodyNotCurrent),
+            );
+        }
+        let final_observation = observe_git_material(workspace);
+        if final_observation.head_sha != preflight.head_sha
+            || final_observation.local_material != preflight.local_material
+        {
+            return (
+                RetirementOutcome::Denied,
+                Some(RetirementReasonCode::MaterialChanged),
+            );
+        }
+        match classify_retirement_material(&final_observation, &intent.expected_material) {
+            Ok(()) => {}
+            Err(reason) => return (RetirementOutcome::Denied, Some(reason)),
+        }
+
+        match remove_managed_worktree(Path::new(&record.repository_path), workspace) {
+            Ok(()) => (RetirementOutcome::Retired, None),
+            Err(_) if !workspace.exists() => (
+                RetirementOutcome::OutcomeAmbiguous,
+                Some(RetirementReasonCode::OutcomeAmbiguous),
+            ),
+            Err(_) => (
+                RetirementOutcome::Failed,
+                Some(RetirementReasonCode::EffectFailed),
+            ),
+        }
+    }
+
+    async fn finish_retirement(
+        &self,
+        session_dir: &Path,
+        intent: RetirementIntent,
+        outcome: RetirementOutcome,
+        reason: Option<RetirementReasonCode>,
+        custody_generation: Option<crate::session::CustodyGenerationEvidence>,
+    ) -> Result<RetirementReceipt> {
+        let receipt = RetirementReceipt {
+            schema_version: RETIREMENT_RECEIPT_SCHEMA_VERSION.to_owned(),
+            intent: intent.clone(),
+            outcome,
+            reason,
+            custody_generation,
+            observed_at: now_millis()?,
+        };
+        let target = retirement_receipt_path(session_dir, &intent.retirement_intent_id);
+        if let Err(error) = durable_write_json(&target, &receipt) {
+            if receipt.outcome == RetirementOutcome::Retired {
+                return Ok(RetirementReceipt {
+                    outcome: RetirementOutcome::OutcomeAmbiguous,
+                    reason: Some(RetirementReasonCode::OutcomeAmbiguous),
+                    ..receipt
+                });
+            }
+            return Err(error).context("persist retirement receipt");
+        }
+        Ok(receipt)
     }
 
     async fn record(&self, execution_id: &str) -> Result<SessionRecord> {
@@ -840,6 +1104,125 @@ impl ProjectExecutorSupervisor {
             .cloned()
             .ok_or_else(|| anyhow!("execution manager is unavailable: {execution_id}"))
     }
+}
+
+fn reconcile_retirement_release(
+    result: (RetirementOutcome, Option<RetirementReasonCode>),
+    release_failed: bool,
+) -> (RetirementOutcome, Option<RetirementReasonCode>) {
+    if release_failed {
+        return (
+            RetirementOutcome::OutcomeAmbiguous,
+            Some(RetirementReasonCode::OutcomeAmbiguous),
+        );
+    }
+    result
+}
+
+fn custody_release_unresolved(record: &SessionRecord) -> bool {
+    record
+        .custody_assessment
+        .as_ref()
+        .and_then(|assessment| assessment.evidence_ref.as_deref())
+        .map(|value| {
+            matches!(
+                value,
+                "CUSTODY_RELEASE_UNRESOLVED" | "CUSTODY_RELEASE_PENDING"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn validate_retirement_intent_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!("RETIREMENT_INTENT_ID_INVALID");
+    }
+    Ok(())
+}
+
+fn retirement_intent_path(session_dir: &Path, intent_id: &str) -> PathBuf {
+    session_dir
+        .join("evidence/retirement/intents")
+        .join(format!("{intent_id}.json"))
+}
+
+fn retirement_receipt_path(session_dir: &Path, intent_id: &str) -> PathBuf {
+    session_dir
+        .join("evidence/retirement/receipts")
+        .join(format!("{intent_id}.json"))
+}
+
+fn persist_retirement_intent(session_dir: &Path, intent: &RetirementIntent) -> Result<bool> {
+    let path = retirement_intent_path(session_dir, &intent.retirement_intent_id);
+    if path.is_file() {
+        let prior: RetirementIntent =
+            serde_json::from_slice(&std::fs::read(&path).context("read retirement intent")?)?;
+        if prior != *intent {
+            bail!("RETIREMENT_INTENT_REPLAY_MISMATCH");
+        }
+        return Ok(true);
+    }
+    durable_write_json(&path, intent).context("persist retirement intent")?;
+    Ok(false)
+}
+
+fn validate_retirement_authorization(
+    record: &SessionRecord,
+    intent: &RetirementIntent,
+) -> std::result::Result<(), RetirementReasonCode> {
+    let Some(binding) = intent.authorization_binding.as_ref() else {
+        return Err(RetirementReasonCode::AuthorizationMissing);
+    };
+    if intent.effect_class != WORKSPACE_RETIRE_EFFECT_CLASS
+        || intent.work_id != record.work_identity
+        || intent.execution_id != record.execution_id
+        || intent.candidate_revision != record.base_sha
+        || intent.expected_material != record.expected_material
+    {
+        return Err(RetirementReasonCode::ScopeMismatch);
+    }
+    let observed_workspace = PathBuf::from(&record.workspace)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&record.workspace))
+        .display()
+        .to_string();
+    if intent.workspace_identity != observed_workspace {
+        return Err(RetirementReasonCode::ScopeMismatch);
+    }
+    let claim = MaterialAuthorizationClaim {
+        work_id: intent.work_id.clone(),
+        execution_id: intent.execution_id.clone(),
+        resource_identity: intent.resource_identity.clone(),
+        workspace_identity: intent.workspace_identity.clone(),
+        candidate_revision: intent.candidate_revision.clone(),
+        effect_class: intent.effect_class.clone(),
+        authorization_digest: intent.authorization_digest.clone(),
+    };
+    binding
+        .validate(&claim)
+        .map_err(|_| RetirementReasonCode::ScopeMismatch)
+}
+
+fn classify_retirement_material(
+    observed: &crate::recovery::MaterialObservation,
+    expected: &ExpectedMaterial,
+) -> std::result::Result<(), RetirementReasonCode> {
+    if observed.local_material == LocalMaterialState::Unknown || observed.head_sha.is_none() {
+        return Err(RetirementReasonCode::MaterialUnknown);
+    }
+    if observed.local_material == LocalMaterialState::Present {
+        return Err(RetirementReasonCode::MaterialPresent);
+    }
+    if observed.head_sha.as_deref() != Some(expected.head_sha.as_str())
+        || observed.local_material != expected.local_material
+    {
+        return Err(RetirementReasonCode::MaterialChanged);
+    }
+    Ok(())
 }
 
 fn record_binding(record: &SessionRecord) -> Result<WorktreeBinding> {
@@ -1385,6 +1768,14 @@ mod increment_a_contract_tests {
             std::fs::read_to_string(workspace.join("effect-C")).unwrap(),
             "C"
         );
+    }
+
+    #[test]
+    fn retirement_release_failure_is_never_terminal_success_or_denial() {
+        let (outcome, reason) =
+            reconcile_retirement_release((RetirementOutcome::Retired, None), true);
+        assert_eq!(outcome, RetirementOutcome::OutcomeAmbiguous);
+        assert_eq!(reason, Some(RetirementReasonCode::OutcomeAmbiguous));
     }
 
     #[tokio::test]

@@ -147,12 +147,13 @@ impl LocalCustodyProvider {
         }
         let held = self
             .current
-            .remove(&grant.scope.collision_identity)
+            .get(&grant.scope.collision_identity)
             .expect("current grant disappeared after validation");
         let rc = unsafe { libc::flock(held._lock.as_raw_fd(), libc::LOCK_UN) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error()).context("release custody lock");
         }
+        self.current.remove(&grant.scope.collision_identity);
         Ok(())
     }
 

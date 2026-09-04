@@ -130,7 +130,7 @@ async fn sessions_namespace_process_ids_and_reject_cross_session_access() {
 }
 
 #[tokio::test]
-async fn close_removes_worktree_preserves_record_and_evidence() {
+async fn close_preserves_worktree_registration_record_and_evidence() {
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -160,7 +160,9 @@ async fn close_removes_worktree_preserves_record_and_evidence() {
 
     let closed = supervisor.close_session(id).await.unwrap();
     assert_eq!(closed.state, SessionState::Closed);
-    assert!(!Path::new(&workspace).exists());
+    assert!(Path::new(&workspace).is_dir());
+    let registered = git(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(registered.contains(&workspace));
     assert!(sessions.join(id).join("session.json").is_file());
     assert!(
         sessions
