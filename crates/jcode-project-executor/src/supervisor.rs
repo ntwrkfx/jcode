@@ -7,9 +7,9 @@ use crate::recovery::{
     observe_git_material, summarize_recovery, unknown_custody,
 };
 use crate::session::{
-    AccessMode, CustodyAssessment, CustodyGenerationEvidence, CustodyState, ExpectedMaterial,
-    IMPLEMENTATION_NAME, LocalMaterialState, PROVIDER_NAME, SESSION_SCHEMA_VERSION,
-    SessionCreateRequest, SessionInspection, SessionLifecycle, SessionRecord, SessionRunnability,
+    AccessMode, CustodyAssessment, CustodyState, ExpectedMaterial, IMPLEMENTATION_NAME,
+    LocalMaterialState, PROVIDER_NAME, SESSION_SCHEMA_VERSION, SessionCreateRequest,
+    SessionInspection, SessionLifecycle, SessionRecord, SessionRunnability,
     WORKTREE_BINDING_SCHEMA_VERSION, WORKTREE_INSPECTION_SCHEMA_VERSION, WorkspaceOrigin,
     WorktreeBinding, WorktreeInspection, WorktreeMode, WorktreeOwnership,
 };
@@ -247,14 +247,13 @@ impl ProjectExecutorSupervisor {
                 == Some(record.expected_material.head_sha.as_str())
                 && observed_material.local_material == record.expected_material.local_material;
             let write_required = binding.access_mode == AccessMode::Write;
-            let mut acquired_lock = None;
             let custody = if record.implementation_revision != implementation_revision {
                 unknown_custody()
             } else if write_required {
                 match WorktreeWriteLock::acquire(&lock_root, &workspace) {
                     Ok(lock) => {
-                        let assessment = confirmed_custody(&executor_instance_id, &workspace);
-                        acquired_lock = Some(lock);
+                        let assessment = indeterminate_custody_after_local_lock_probe();
+                        drop(lock);
                         assessment
                     }
                     Err(error) if error.to_string().contains("WORKTREE_BUSY") => not_held_custody(),
@@ -287,9 +286,6 @@ impl ProjectExecutorSupervisor {
                 ) {
                     Ok(manager) => {
                         managers.insert(record.execution_id.clone(), Arc::new(manager));
-                        if let Some(lock) = acquired_lock.take() {
-                            locks.insert(record.execution_id.clone(), lock);
-                        }
                     }
                     Err(_) => {
                         decision.result = SessionRunnability::Quarantined;
@@ -297,7 +293,6 @@ impl ProjectExecutorSupervisor {
                     }
                 }
             }
-            drop(acquired_lock);
             record.runnability = decision.result;
             record.custody_assessment = Some(custody.clone());
             write_record(&session_dir, &record)?;
@@ -956,15 +951,12 @@ fn now_millis() -> Result<u64> {
     u64::try_from(millis).context("timestamp does not fit u64")
 }
 
-fn confirmed_custody(executor_instance_id: &str, workspace: &Path) -> CustodyAssessment {
+fn indeterminate_custody_after_local_lock_probe() -> CustodyAssessment {
     CustodyAssessment {
-        state: CustodyState::Confirmed,
+        state: CustodyState::Unknown,
         assessed_at: now_millis().unwrap_or(0),
-        executor_instance_id: Some(executor_instance_id.to_owned()),
-        generation: Some(CustodyGenerationEvidence {
-            provider: "PROJECT_EXECUTOR_FENCE".to_owned(),
-            token: format!("{executor_instance_id}:{:016x}", stable_path_key(workspace)),
-        }),
+        executor_instance_id: None,
+        generation: None,
         evidence_ref: None,
     }
 }
@@ -1088,4 +1080,17 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod increment_a_contract_tests {
+    use super::*;
+
+    #[test]
+    fn local_lock_probe_does_not_mint_custody_generation() {
+        let assessment = indeterminate_custody_after_local_lock_probe();
+        assert_eq!(assessment.state, CustodyState::Unknown);
+        assert_eq!(assessment.executor_instance_id, None);
+        assert_eq!(assessment.generation, None);
+    }
 }
