@@ -57,6 +57,23 @@ async fn handle_inner(
         ExecutorCommand::SessionInspect { execution_id } => {
             Ok(to_value(supervisor.inspect_session(&execution_id).await?)?)
         }
+        ExecutorCommand::RepoPatchApply {
+            execution_id,
+            repository,
+            base_sha,
+            provider_binding_sha256,
+            patch,
+        } => Ok(to_value(
+            supervisor
+                .apply_repository_patch(
+                    &execution_id,
+                    &repository,
+                    &base_sha,
+                    &provider_binding_sha256,
+                    patch,
+                )
+                .await?,
+        )?),
         ExecutorCommand::ProcessStart {
             execution_id,
             argv,

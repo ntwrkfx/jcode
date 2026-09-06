@@ -1,6 +1,7 @@
 use crate::process::{
     ExecutionProcessManager, ExecutionProcessOutput, ExecutionProcessRef, ExecutionProcessState,
 };
+use crate::protocol::{RepositoryPatch, RepositoryPatchReceipt};
 use crate::session::{
     AccessMode, IMPLEMENTATION_NAME, PROVIDER_NAME, SESSION_SCHEMA_VERSION, SessionCreateRequest,
     SessionInspection, SessionRecord, SessionState, WORKTREE_BINDING_SCHEMA_VERSION,
@@ -8,11 +9,13 @@ use crate::session::{
     WorktreeOwnership,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -468,6 +471,108 @@ impl ProjectExecutorSupervisor {
         })
     }
 
+    pub async fn apply_repository_patch(
+        &self,
+        execution_id: &str,
+        repository: &str,
+        base_sha: &str,
+        provider_binding_sha256: &str,
+        patch: RepositoryPatch,
+    ) -> Result<RepositoryPatchReceipt> {
+        validate_sha(base_sha, "base_sha")?;
+        validate_sha256_ref(provider_binding_sha256, "provider_binding_sha256")?;
+        let (touched_paths, changed_lines) = validate_repository_patch(&patch)?;
+        let inspection = self.inspect_session(execution_id).await?;
+        if inspection.state != SessionState::Ready {
+            bail!("execution is not ready: {execution_id}");
+        }
+        if inspection.repository != repository
+            || inspection.worktree_binding.repository != repository
+        {
+            bail!("repository does not match admitted execution");
+        }
+        if inspection.base_sha != base_sha
+            || inspection.worktree_binding.resolved_sha != base_sha
+            || inspection.head_sha != base_sha
+        {
+            bail!("base SHA does not match admitted execution");
+        }
+        if inspection.worktree_binding.mode != WorktreeMode::Managed
+            || inspection.worktree_binding.ownership != WorktreeOwnership::Harness
+            || inspection.worktree_binding.access_mode != AccessMode::Write
+        {
+            bail!("repository patch requires a Harness-managed writable worktree");
+        }
+        if inspection.worktree_binding.device_id.is_none()
+            || inspection.worktree_binding.git_common_dir.is_none()
+        {
+            bail!("repository patch requires complete writer identity");
+        }
+        if !inspection.clean {
+            bail!("repository patch requires a clean admitted workspace");
+        }
+        if !self.locks.lock().await.contains_key(execution_id) {
+            bail!("repository patch requires current writer custody");
+        }
+
+        let workspace = PathBuf::from(&inspection.workspace);
+        for path in &touched_paths {
+            let candidate = workspace.join(path);
+            let metadata = std::fs::symlink_metadata(&candidate)
+                .with_context(|| format!("inspect patch target {path}"))?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                bail!("patch target must be an existing regular file: {path}");
+            }
+        }
+
+        git_apply(&workspace, &patch.content, true)?;
+        git_apply(&workspace, &patch.content, false)?;
+
+        if git(&workspace, &["rev-parse", "HEAD"])? != base_sha {
+            bail!("repository patch unexpectedly changed HEAD");
+        }
+        let changed = git(&workspace, &["diff", "--name-only"])?;
+        let changed_paths: BTreeSet<String> = changed
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let expected_paths: BTreeSet<String> = touched_paths.iter().cloned().collect();
+        if changed_paths != expected_paths {
+            bail!("repository patch changed paths outside the admitted patch");
+        }
+        git(&workspace, &["diff", "--check"])?;
+
+        let patch_bytes = patch.content.len();
+        let patch_sha256 = sha256_ref(patch.content.as_bytes());
+        let evidence = serde_json::json!({
+            "schema_version": "project-executor-patch-evidence/v1",
+            "execution_id": execution_id,
+            "repository": repository,
+            "base_sha": base_sha,
+            "provider_binding_sha256": provider_binding_sha256,
+            "patch_sha256": patch_sha256,
+            "touched_paths": touched_paths,
+            "device_id": inspection.worktree_binding.device_id,
+            "git_common_dir": inspection.worktree_binding.git_common_dir,
+        });
+        let provider_evidence_ref = sha256_ref(&serde_json::to_vec(&evidence)?);
+        Ok(RepositoryPatchReceipt {
+            schema_version: "repository-patch-receipt/v1".to_owned(),
+            execution_id: execution_id.to_owned(),
+            repository: repository.to_owned(),
+            base_sha: base_sha.to_owned(),
+            provider_binding_sha256: provider_binding_sha256.to_owned(),
+            patch_sha256,
+            patch_bytes,
+            changed_lines,
+            touched_paths,
+            applied_at: format!("unix-ms:{}", now_millis()?),
+            provider_evidence_ref,
+            status: "APPLIED".to_owned(),
+        })
+    }
+
     pub async fn start_process(
         &self,
         execution_id: &str,
@@ -754,6 +859,149 @@ fn local_process_id<'a>(execution_id: &str, process_id: &'a str) -> Result<&'a s
     process_id
         .strip_prefix(&prefix)
         .ok_or_else(|| anyhow!("process does not belong to execution {execution_id}"))
+}
+
+const MAX_PATCH_BYTES: usize = 65_536;
+const MAX_PATCH_FILES: usize = 16;
+const MAX_PATCH_CHANGED_LINES: usize = 4_096;
+const MAX_PATCH_PATH_BYTES: usize = 512;
+const RESERVED_PATCH_ROOTS: &[&str] = &[".git", ".jj", ".hg", ".svn", ".worktrees", ".gitmodules"];
+const FORBIDDEN_PATCH_MARKERS: &[&str] = &[
+    "/dev/null",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "GIT binary patch",
+    "Binary files ",
+    "old mode ",
+    "new mode ",
+    "new file mode ",
+    "deleted file mode ",
+];
+
+fn validate_repository_patch(patch: &RepositoryPatch) -> Result<(Vec<String>, usize)> {
+    if patch.schema_version != "repository-patch/v1" || patch.format != "unified-diff" {
+        bail!("unsupported repository patch contract");
+    }
+    let bytes = patch.content.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_PATCH_BYTES {
+        bail!("patch exceeds bounded size");
+    }
+    if patch.content.contains('\r') || patch.content.contains('\0') {
+        bail!("patch contains forbidden control characters");
+    }
+    if FORBIDDEN_PATCH_MARKERS
+        .iter()
+        .any(|marker| patch.content.contains(marker))
+    {
+        bail!("patch contains unsupported file operation");
+    }
+
+    let mut headers = Vec::new();
+    let mut changed_lines = 0usize;
+    for line in patch.content.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            let mut path = line[4..].split('\t').next().unwrap_or_default();
+            if let Some(stripped) = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")) {
+                path = stripped;
+            }
+            validate_patch_path(path)?;
+            headers.push(path.to_owned());
+        } else if (line.starts_with('+') || line.starts_with('-'))
+            && !line.starts_with("+++")
+            && !line.starts_with("---")
+        {
+            changed_lines += 1;
+        }
+    }
+    if headers.is_empty() || headers.len() % 2 != 0 {
+        bail!("patch must modify existing files only");
+    }
+    let mut touched_paths = Vec::new();
+    for pair in headers.chunks_exact(2) {
+        if pair[0] != pair[1] {
+            bail!("patch must modify existing files only");
+        }
+        if !touched_paths.contains(&pair[0]) {
+            touched_paths.push(pair[0].clone());
+        }
+    }
+    if touched_paths.len() > MAX_PATCH_FILES {
+        bail!("patch exceeds maximum files");
+    }
+    if changed_lines > MAX_PATCH_CHANGED_LINES {
+        bail!("patch exceeds maximum changed lines");
+    }
+    Ok((touched_paths, changed_lines))
+}
+
+fn validate_patch_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.len() > MAX_PATCH_PATH_BYTES
+        || path.starts_with('/')
+        || path.contains('\\')
+    {
+        bail!("forbidden patch path");
+    }
+    let candidate = Path::new(path);
+    let mut components = candidate.components();
+    let first = match components.next() {
+        Some(Component::Normal(value)) => value.to_string_lossy(),
+        _ => bail!("forbidden patch path"),
+    };
+    if RESERVED_PATCH_ROOTS.iter().any(|root| first == *root)
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("forbidden patch path");
+    }
+    Ok(())
+}
+
+fn validate_sha256_ref(value: &str, field: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        bail!("{field} must be a sha256 reference");
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("{field} must contain 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn sha256_ref(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn git_apply(repository: &Path, patch: &str, check_only: bool) -> Result<()> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository).arg("apply");
+    if check_only {
+        command.arg("--check");
+    }
+    command.args(["--whitespace=nowarn", "-"]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("start git apply")?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("git apply stdin is unavailable"))?
+        .write_all(patch.as_bytes())
+        .context("write patch to git apply")?;
+    let output = child.wait_with_output().context("wait for git apply")?;
+    if !output.status.success() {
+        bail!(
+            "git apply failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn validate_sha(value: &str, field: &str) -> Result<()> {
