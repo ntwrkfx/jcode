@@ -72,6 +72,31 @@ impl WorkerResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPatch {
+    pub schema_version: String,
+    pub format: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPatchReceipt {
+    pub schema_version: String,
+    pub execution_id: String,
+    pub repository: String,
+    pub base_sha: String,
+    pub provider_binding_sha256: String,
+    pub patch_sha256: String,
+    pub patch_bytes: usize,
+    pub changed_lines: usize,
+    pub touched_paths: Vec<String>,
+    pub applied_at: String,
+    pub provider_evidence_ref: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorCommand {
@@ -93,6 +118,13 @@ pub enum ExecutorCommand {
     },
     SessionInspect {
         execution_id: String,
+    },
+    RepoPatchApply {
+        execution_id: String,
+        repository: String,
+        base_sha: String,
+        provider_binding_sha256: String,
+        patch: RepositoryPatch,
     },
     ProcessStart {
         execution_id: String,

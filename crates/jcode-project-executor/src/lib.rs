@@ -3,6 +3,7 @@
 pub mod custody;
 mod durable;
 pub mod effect;
+mod first_cutover;
 mod process;
 mod protocol;
 mod recovery;
@@ -13,6 +14,9 @@ mod supervisor;
 pub mod transactional_upgrade;
 mod worker;
 
+pub use first_cutover::{
+    FirstCutoverAssessment, FirstCutoverObservation, assess_first_cutover,
+};
 pub use process::{
     ExecutionProcessManager, ExecutionProcessOutput, ExecutionProcessRef, ExecutionProcessState,
 };
