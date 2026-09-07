@@ -190,8 +190,17 @@ async fn supervisor_for(sessions: &Path, worktree_root: &Path) -> ProjectExecuto
     ProjectExecutorSupervisor::create_with_worktree_root(sessions, worktree_root, REVISION).unwrap()
 }
 
+static RETIREMENT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn retirement_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    RETIREMENT_TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tokio::test]
 async fn explicit_retirement_rejects_external_workspace() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-external");
     let sha = make_repo(&repo);
@@ -226,6 +235,7 @@ async fn explicit_retirement_rejects_external_workspace() {
 
 #[tokio::test]
 async fn explicit_retirement_rejects_legacy_workspace() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-legacy");
     let sha = make_repo(&repo);
@@ -260,6 +270,7 @@ async fn explicit_retirement_rejects_legacy_workspace() {
 
 #[tokio::test]
 async fn explicit_retirement_rejects_dirty_managed_workspace() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-dirty");
     let sha = make_repo(&repo);
@@ -293,6 +304,7 @@ async fn explicit_retirement_rejects_dirty_managed_workspace() {
 #[tokio::test]
 async fn syntactically_valid_digest_without_independently_admitted_binding_denies_before_material_effect()
  {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-auth");
     let sha = make_repo(&repo);
@@ -326,6 +338,7 @@ async fn syntactically_valid_digest_without_independently_admitted_binding_denie
 
 #[tokio::test]
 async fn candidate_scope_mismatch_denies_without_material_effect() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-scope");
     let sha = make_repo(&repo);
@@ -357,6 +370,7 @@ async fn candidate_scope_mismatch_denies_without_material_effect() {
 
 #[tokio::test]
 async fn clean_managed_retirement_is_idempotent_for_same_intent() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-clean");
     let sha = make_repo(&repo);
@@ -392,6 +406,7 @@ async fn clean_managed_retirement_is_idempotent_for_same_intent() {
 
 #[tokio::test]
 async fn absent_workspace_without_terminal_receipt_is_not_fabricated_as_retired() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-absent");
     let sha = make_repo(&repo);
@@ -421,12 +436,14 @@ async fn absent_workspace_without_terminal_receipt_is_not_fabricated_as_retired(
 
 #[test]
 fn session_record_type_remains_non_retirement_authority() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let _ = std::mem::size_of::<SessionRecord>();
     assert_eq!(WORKSPACE_RETIRE_EFFECT_CLASS, "WORKSPACE_RETIRE");
 }
 
 #[tokio::test]
 async fn current_custody_held_by_wrong_executor_denies_retirement() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-custody-blocked");
     let sha = make_repo(&repo);
@@ -467,6 +484,7 @@ async fn current_custody_held_by_wrong_executor_denies_retirement() {
 
 #[tokio::test]
 async fn persisted_stale_g1_cannot_replace_fresh_retirement_custody() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-stale-g1");
     let sha = make_repo(&repo);
@@ -513,6 +531,7 @@ async fn persisted_stale_g1_cannot_replace_fresh_retirement_custody() {
 
 #[tokio::test]
 async fn clean_retirement_reacquires_generation_distinct_from_historical_g1() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-fresh-g2");
     let sha = make_repo(&repo);
@@ -552,6 +571,7 @@ async fn clean_retirement_reacquires_generation_distinct_from_historical_g1() {
 
 #[tokio::test]
 async fn material_unknown_denies_and_preserves_workspace() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-unknown");
     let sha = make_repo(&repo);
@@ -679,6 +699,7 @@ exec "$REAL" "$@"
 #[cfg(unix)]
 #[tokio::test]
 async fn clean_preflight_then_material_change_before_effect_is_denied() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-toctou");
     let sha = make_repo(&repo);
@@ -712,6 +733,7 @@ async fn clean_preflight_then_material_change_before_effect_is_denied() {
 #[cfg(unix)]
 #[tokio::test]
 async fn worktree_remove_failure_preserves_closed_material_and_never_reports_retired() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-effect-fail");
     let sha = make_repo(&repo);
@@ -750,6 +772,7 @@ async fn worktree_remove_failure_preserves_closed_material_and_never_reports_ret
 #[cfg(unix)]
 #[tokio::test]
 async fn delete_effect_succeeds_but_terminal_result_is_lost_remains_ambiguous() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-ambiguous");
     let sha = make_repo(&repo);
@@ -786,6 +809,7 @@ async fn delete_effect_succeeds_but_terminal_result_is_lost_remains_ambiguous() 
 
 #[tokio::test]
 async fn current_generation_for_wrong_collision_cannot_authorize_target_retirement() {
+    let _retirement_test_env_lock = retirement_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo-wrong-collision");
     let sha = make_repo(&repo);

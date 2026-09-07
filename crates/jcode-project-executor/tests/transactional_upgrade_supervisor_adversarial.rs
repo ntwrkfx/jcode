@@ -78,6 +78,7 @@ fn resume_intent(
 
 #[tokio::test]
 async fn prepare_quiesces_releases_g1_and_blocks_old_effects() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -120,6 +121,7 @@ async fn prepare_quiesces_releases_g1_and_blocks_old_effects() {
 
 #[tokio::test]
 async fn successor_recovery_uses_fresh_generation_and_requires_resume_before_effect() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -175,6 +177,7 @@ async fn successor_recovery_uses_fresh_generation_and_requires_resume_before_eff
 
 #[tokio::test]
 async fn caller_supplied_digest_cannot_replace_submitted_event_binding() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -207,6 +210,7 @@ async fn caller_supplied_digest_cannot_replace_submitted_event_binding() {
 
 #[tokio::test]
 async fn stale_g2_resume_is_rejected_after_successor_restarts_again() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -242,6 +246,7 @@ async fn stale_g2_resume_is_rejected_after_successor_restarts_again() {
 
 #[tokio::test]
 async fn concurrent_resume_accepts_at_most_one_transition() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -284,6 +289,7 @@ async fn concurrent_resume_accepts_at_most_one_transition() {
 
 #[tokio::test]
 async fn wrong_successor_revision_fails_closed_and_does_not_reopen_admission() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -315,8 +321,13 @@ async fn wrong_successor_revision_fails_closed_and_does_not_reopen_admission() {
     );
 }
 
-#[cfg(unix)]
 static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[cfg(unix)]
 struct PathGuard(std::ffi::OsString);
@@ -414,6 +425,7 @@ exec /usr/bin/git "$@"
 #[cfg(unix)]
 #[tokio::test]
 async fn successor_verification_reobserves_material_after_recovery_and_g2() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -430,9 +442,6 @@ async fn successor_verification_reobserves_material_after_recovery_and_g2() {
         .unwrap();
     drop(first);
 
-    let _path_env_lock = PATH_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _path = install_second_status_dirty_git(root.path());
     let successor = ProjectExecutorSupervisor::create(&sessions, REV2).unwrap();
     let state = successor.inspect_transactional_upgrade().unwrap();
@@ -450,6 +459,7 @@ async fn successor_verification_reobserves_material_after_recovery_and_g2() {
 
 #[tokio::test]
 async fn completed_upgrade_can_begin_a_second_replacement_with_fresh_predecessor_generation() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -489,6 +499,7 @@ async fn completed_upgrade_can_begin_a_second_replacement_with_fresh_predecessor
 
 #[tokio::test]
 async fn consumed_event_id_remains_consumed_across_completed_transaction_rotation() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -540,6 +551,7 @@ async fn consumed_event_id_remains_consumed_across_completed_transaction_rotatio
 
 #[tokio::test]
 async fn logical_close_is_blocked_while_replacement_is_quiesced() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -561,6 +573,7 @@ async fn logical_close_is_blocked_while_replacement_is_quiesced() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiesce_waits_for_inflight_admission_before_replacement_advances() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -573,9 +586,6 @@ async fn quiesce_waits_for_inflight_admission_before_replacement_advances() {
         .create_session(request(target, &repo, &sha))
         .await
         .unwrap();
-    let _path_env_lock = PATH_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_path, entered, release) = install_blocking_worktree_add_git(root.path());
 
     let create_supervisor = supervisor.clone();
@@ -615,6 +625,7 @@ async fn quiesce_waits_for_inflight_admission_before_replacement_advances() {
 
 #[tokio::test]
 async fn retirement_is_blocked_while_replacement_is_quiesced() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -652,6 +663,7 @@ async fn retirement_is_blocked_while_replacement_is_quiesced() {
 
 #[tokio::test]
 async fn successor_rejects_corrupted_durable_checkpoint_instead_of_echoing_request_generation() {
+    let _test_env_lock = test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
     let sha = make_repo(&repo);
@@ -694,6 +706,7 @@ async fn successor_rejects_corrupted_durable_checkpoint_instead_of_echoing_reque
 
 #[tokio::test]
 async fn completed_upgrade_rejects_stale_or_jumped_checkpoint_on_next_prepare() {
+    let _test_env_lock = test_env_lock();
     for invalid_generation in [7_u64, 9_u64] {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
