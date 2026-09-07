@@ -316,6 +316,9 @@ async fn wrong_successor_revision_fails_closed_and_does_not_reopen_admission() {
 }
 
 #[cfg(unix)]
+static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
 struct PathGuard(std::ffi::OsString);
 #[cfg(unix)]
 impl Drop for PathGuard {
@@ -339,13 +342,14 @@ fn install_blocking_worktree_add_git(
         format!(
             r#"#!/bin/sh
 case " $* " in
-  *" worktree add --detach "*)
+  *"{root}"*" worktree add --detach "*)
     : > '{entered}'
     while [ ! -e '{release}' ]; do sleep 0.01; done
     ;;
 esac
 exec /usr/bin/git "$@"
 "#,
+            root = root.display(),
             entered = entered.display(),
             release = release.display()
         ),
@@ -377,7 +381,7 @@ fn install_second_status_dirty_git(root: &Path) -> PathGuard {
         format!(
             r#"#!/bin/sh
 case " $* " in
-  *" status --porcelain"*)
+  *"{root}"*" status --porcelain"*)
     n=$(cat '{counter}')
     n=$((n + 1))
     printf '%s\n' "$n" > '{counter}'
@@ -389,6 +393,7 @@ case " $* " in
 esac
 exec /usr/bin/git "$@"
 "#,
+            root = root.display(),
             counter = counter.display()
         ),
     )
@@ -425,6 +430,9 @@ async fn successor_verification_reobserves_material_after_recovery_and_g2() {
         .unwrap();
     drop(first);
 
+    let _path_env_lock = PATH_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _path = install_second_status_dirty_git(root.path());
     let successor = ProjectExecutorSupervisor::create(&sessions, REV2).unwrap();
     let state = successor.inspect_transactional_upgrade().unwrap();
@@ -565,6 +573,9 @@ async fn quiesce_waits_for_inflight_admission_before_replacement_advances() {
         .create_session(request(target, &repo, &sha))
         .await
         .unwrap();
+    let _path_env_lock = PATH_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_path, entered, release) = install_blocking_worktree_add_git(root.path());
 
     let create_supervisor = supervisor.clone();
