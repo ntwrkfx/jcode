@@ -20,6 +20,8 @@ pub enum WorkerCommand {
         process_id: String,
         #[serde(default)]
         offset: u64,
+        #[serde(default)]
+        stderr_offset: u64,
         #[serde(default = "default_limit")]
         limit: usize,
     },
@@ -138,6 +140,8 @@ pub enum ExecutorCommand {
         process_id: String,
         #[serde(default)]
         offset: u64,
+        #[serde(default)]
+        stderr_offset: u64,
         #[serde(default = "default_limit")]
         limit: usize,
     },

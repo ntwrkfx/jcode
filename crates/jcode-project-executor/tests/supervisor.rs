@@ -114,7 +114,7 @@ async fn sessions_namespace_process_ids_and_reject_cross_session_access() {
         .unwrap();
     assert!(process.process_id.starts_with(&format!("{a}:p-")));
     let error = supervisor
-        .read_process(b, &process.process_id, 0, 32)
+        .read_process(b, &process.process_id, 0, 0, 32)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("does not belong to execution"));
@@ -123,7 +123,7 @@ async fn sessions_namespace_process_ids_and_reject_cross_session_access() {
         .await
         .unwrap();
     let output = supervisor
-        .read_process(a, &process.process_id, 0, 32)
+        .read_process(a, &process.process_id, 0, 0, 32)
         .await
         .unwrap();
     assert_eq!(output.data, "alpha");
@@ -218,7 +218,7 @@ async fn git_remains_usable_inside_isolated_worktree() {
         jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) }
     );
     let output = supervisor
-        .read_process(id, &process.process_id, 0, 1024)
+        .read_process(id, &process.process_id, 0, 0, 1024)
         .await
         .unwrap();
     assert_eq!(output.data, "");

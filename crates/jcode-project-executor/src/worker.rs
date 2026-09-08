@@ -49,9 +49,10 @@ impl ExecutionWorker {
             WorkerCommand::ProcessRead {
                 process_id,
                 offset,
+                stderr_offset,
                 limit,
             } => Ok(to_value(
-                self.manager.read(&process_id, offset, limit).await?,
+                self.manager.read(&process_id, offset, stderr_offset, limit).await?,
             )?),
             WorkerCommand::ProcessWait {
                 process_id,

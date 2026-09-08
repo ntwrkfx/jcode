@@ -24,7 +24,7 @@ async fn starts_argv_waits_and_reads_output() {
         .unwrap();
     assert_eq!(state, ExecutionProcessState::Exited { code: Some(7) });
 
-    let output = manager.read(&process.process_id, 0, 1024).await.unwrap();
+    let output = manager.read(&process.process_id, 0, 0, 1024).await.unwrap();
     assert_eq!(output.data, "alpha\nbeta\n");
     assert!(output.eof);
 }
@@ -58,12 +58,12 @@ async fn read_is_cursor_bounded() {
         .unwrap();
     manager.wait(&process.process_id, None).await.unwrap();
 
-    let first = manager.read(&process.process_id, 0, 3).await.unwrap();
+    let first = manager.read(&process.process_id, 0, 0, 3).await.unwrap();
     assert_eq!(first.data, "abc");
     assert_eq!(first.next_offset, 3);
     assert!(!first.eof);
 
-    let second = manager.read(&process.process_id, 3, 3).await.unwrap();
+    let second = manager.read(&process.process_id, 3, 0, 3).await.unwrap();
     assert_eq!(second.data, "def");
     assert_eq!(second.next_offset, 6);
     assert!(second.eof);
@@ -150,6 +150,32 @@ async fn process_filesystem_and_environment_are_project_bounded() {
         .unwrap();
     let state = manager.wait(&process.process_id, None).await.unwrap();
     assert_eq!(state, ExecutionProcessState::Exited { code: Some(0) });
-    let output = manager.read(&process.process_id, 0, 64).await.unwrap();
+    let output = manager.read(&process.process_id, 0, 0, 64).await.unwrap();
     assert_eq!(output.data, "bounded");
+}
+
+#[tokio::test]
+async fn stdout_and_stderr_have_independent_cursors() {
+    let workspace = tempfile::tempdir().unwrap();
+    let manager = ExecutionProcessManager::create(workspace.path()).unwrap();
+    let process = manager
+        .start(
+            argv(&["bash", "-c", "printf abcdef; printf 12345 >&2"]),
+            None,
+        )
+        .await
+        .unwrap();
+    manager.wait(&process.process_id, None).await.unwrap();
+
+    let first = manager.read(&process.process_id, 0, 0, 3).await.unwrap();
+    assert_eq!((first.data.as_str(), first.next_offset), ("abc", 3));
+    assert_eq!((first.stderr_data.as_str(), first.stderr_next_offset), ("123", 3));
+    assert!(!first.eof);
+    assert!(!first.stderr_eof);
+
+    let second = manager.read(&process.process_id, 3, 3, 3).await.unwrap();
+    assert_eq!((second.data.as_str(), second.next_offset), ("def", 6));
+    assert_eq!((second.stderr_data.as_str(), second.stderr_next_offset), ("45", 5));
+    assert!(second.eof);
+    assert!(second.stderr_eof);
 }

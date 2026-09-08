@@ -90,10 +90,11 @@ async fn handle_inner(
             execution_id,
             process_id,
             offset,
+            stderr_offset,
             limit,
         } => Ok(to_value(
             supervisor
-                .read_process(&execution_id, &process_id, offset, limit)
+                .read_process(&execution_id, &process_id, offset, stderr_offset, limit)
                 .await?,
         )?),
         ExecutorCommand::ProcessWait {

@@ -33,12 +33,17 @@ pub struct ExecutionProcessOutput {
     pub next_offset: u64,
     pub data: String,
     pub eof: bool,
+    pub stderr_offset: u64,
+    pub stderr_next_offset: u64,
+    pub stderr_data: String,
+    pub stderr_eof: bool,
 }
 
 struct ProcessRecord {
     pid: u32,
     child: Mutex<Child>,
-    output_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
     state: Mutex<ExecutionProcessState>,
 }
 
@@ -110,21 +115,16 @@ impl ExecutionProcessManager {
         }
         let cwd = self.resolve_cwd(cwd.as_deref())?;
         let process_id = format!("p-{}", Uuid::new_v4().simple());
-        let output_path = self
-            .state_root
-            .join("processes")
-            .join(format!("{process_id}.log"));
-        let output = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&output_path)
-            .context("create process output file")?;
-        let stderr = output.try_clone().context("clone process output handle")?;
+        let stdout_path = self.state_root.join("processes").join(format!("{process_id}.stdout"));
+        let stderr_path = self.state_root.join("processes").join(format!("{process_id}.stderr"));
+        let stdout = OpenOptions::new().create_new(true).read(true).write(true)
+            .open(&stdout_path).context("create process stdout file")?;
+        let stderr = OpenOptions::new().create_new(true).read(true).write(true)
+            .open(&stderr_path).context("create process stderr file")?;
 
         let mut command = self.sandbox_command(&argv, &cwd)?;
         command.stdin(Stdio::null());
-        command.stdout(Stdio::from(output));
+        command.stdout(Stdio::from(stdout));
         command.stderr(Stdio::from(stderr));
         command.kill_on_drop(true);
         #[cfg(unix)]
@@ -144,7 +144,8 @@ impl ExecutionProcessManager {
         let record = Arc::new(ProcessRecord {
             pid,
             child: Mutex::new(child),
-            output_path,
+            stdout_path,
+            stderr_path,
             state: Mutex::new(ExecutionProcessState::Running),
         });
         self.processes
@@ -158,6 +159,7 @@ impl ExecutionProcessManager {
         &self,
         process_id: &str,
         offset: u64,
+        stderr_offset: u64,
         limit: usize,
     ) -> Result<ExecutionProcessOutput> {
         if limit == 0 || limit > MAX_READ_BYTES {
@@ -165,25 +167,19 @@ impl ExecutionProcessManager {
         }
         let record = self.record(process_id).await?;
         let state = self.refresh(&record).await?;
-        let mut file = tokio::fs::File::open(&record.output_path).await?;
-        let len = file.metadata().await?.len();
-        if offset > len {
-            bail!("read offset exceeds available output");
-        }
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let remaining = len.saturating_sub(offset) as usize;
-        let count = remaining.min(limit);
-        let mut bytes = vec![0; count];
-        if count > 0 {
-            file.read_exact(&mut bytes).await?;
-        }
-        let next_offset = offset + count as u64;
+        let (data, next_offset, stdout_len) = read_stream(&record.stdout_path, offset, limit).await?;
+        let (stderr_data, stderr_next_offset, stderr_len) =
+            read_stream(&record.stderr_path, stderr_offset, limit).await?;
         Ok(ExecutionProcessOutput {
             process_id: process_id.to_owned(),
             offset,
             next_offset,
-            data: String::from_utf8_lossy(&bytes).into_owned(),
-            eof: state != ExecutionProcessState::Running && next_offset >= len,
+            data,
+            eof: state != ExecutionProcessState::Running && next_offset >= stdout_len,
+            stderr_offset,
+            stderr_next_offset,
+            stderr_data,
+            stderr_eof: state != ExecutionProcessState::Running && stderr_next_offset >= stderr_len,
         })
     }
 
@@ -366,6 +362,22 @@ impl ExecutionProcessManager {
         }
         Ok(resolved)
     }
+}
+
+async fn read_stream(path: &Path, offset: u64, limit: usize) -> Result<(String, u64, u64)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    if offset > len {
+        bail!("read offset exceeds available output");
+    }
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let count = (len.saturating_sub(offset) as usize).min(limit);
+    let mut bytes = vec![0; count];
+    if count > 0 {
+        file.read_exact(&mut bytes).await?;
+    }
+    let next_offset = offset + count as u64;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), next_offset, len))
 }
 
 fn add_mount_parents(directories: &mut BTreeSet<PathBuf>, path: &Path) {

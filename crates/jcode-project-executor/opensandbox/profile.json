@@ -1,0 +1,14 @@
+{
+  "schema_version": "opensandbox-profile/v1",
+  "profile_id": "project-executor-build",
+  "image": "local/project-executor-builder:bookworm-rust1.96-v2",
+  "runtime": "docker",
+  "cpu": "4",
+  "memory": "8Gi",
+  "timeout_seconds": 7200,
+  "workspace_mount": true,
+  "input_archive": "/mnt/artifacts/project-executor-source.tar.zst",
+  "output_dir": "/mnt/artifacts/project-executor-build",
+  "behavioral_acceptance": "CT5011_BWRAP_RUNTIME_REQUIRED",
+  "authority_effect": "NONE"
+}

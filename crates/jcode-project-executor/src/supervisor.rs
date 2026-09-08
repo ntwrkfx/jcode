@@ -1115,11 +1115,12 @@ impl ProjectExecutorSupervisor {
         execution_id: &str,
         process_id: &str,
         offset: u64,
+        stderr_offset: u64,
         limit: usize,
     ) -> Result<ExecutionProcessOutput> {
         let local_id = local_process_id(execution_id, process_id)?;
         let manager = self.manager(execution_id).await?;
-        let mut output = manager.read(local_id, offset, limit).await?;
+        let mut output = manager.read(local_id, offset, stderr_offset, limit).await?;
         output.process_id = process_id.to_owned();
         Ok(output)
     }
