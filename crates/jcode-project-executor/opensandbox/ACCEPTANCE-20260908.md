@@ -38,3 +38,18 @@ The OpenSandbox security ceiling intentionally blocks nested `bwrap`; it was not
 - No runtime service restart, deployment, or canonical promotion occurred.
 
 The previously deployed runtime identity `8c48d362c4d04bac3d56094fb0d02d96380d306f` remains historical behavioral evidence only; its source provenance is unresolved and it is not the accepted source identity.
+
+## HC-07 bounded direct canary
+
+A source-built supervisor from implementation commit `fd8d10365b55a6b0261707c75843db91f2b29108` was started on an isolated CT5011 socket, session root, worktree root, and device UUID. The canonical Executor and route were not changed.
+
+- Health: `SERVING` / recovery `HEALTHY`
+- Session create: `READY`
+- Process exit: `0`
+- stdout cursor: `0 -> 3 -> 6`, data `abc` then `def`
+- stderr cursor: `0 -> 3 -> 5`, data `123` then `45`
+- stdout/stderr EOF: true on final independent reads
+- Session close: clean; receipt state `CLOSED`
+- Reported implementation revision: `fd8d10365b55a6b0261707c75843db91f2b29108`
+- Canary supervisor was stopped after acceptance.
+- Existing `8c48d362...` supervisor PID and route listener on `10.0.0.191:9443` remained unchanged.
