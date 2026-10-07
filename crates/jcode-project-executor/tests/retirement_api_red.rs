@@ -690,7 +690,7 @@ exec "$REAL" "$@"
     unsafe {
         std::env::set_var("PATH", new_path);
         std::env::set_var("C_RED_GIT_MODE", mode);
-        std::env::set_var("C_RED_GIT_TARGET", target.canonicalize().unwrap());
+        std::env::set_var("C_RED_GIT_TARGET", target);
         std::env::set_var("C_RED_GIT_COUNTER", counter);
     }
     guard

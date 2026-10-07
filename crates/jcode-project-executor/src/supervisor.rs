@@ -626,7 +626,10 @@ impl ProjectExecutorSupervisor {
         validate_sha(&head_sha, "worktree HEAD")?;
         let branch = branch(path)?;
         let dirty = !git(path, &["status", "--porcelain"])?.is_empty();
+        #[cfg(target_os = "linux")]
         let owner = command_output("stat", &["-c", "%U", &path.display().to_string()])?;
+        #[cfg(target_os = "macos")]
+        let owner = command_output("stat", &["-f", "%Su", &path.display().to_string()])?;
         let writer = self.writer_for_path(path).await?;
         Ok(WorktreeInspection {
             schema_version: WORKTREE_INSPECTION_SCHEMA_VERSION.to_owned(),
@@ -1534,6 +1537,41 @@ fn persist_retirement_intent(session_dir: &Path, intent: &RetirementIntent) -> R
     Ok(false)
 }
 
+fn canonical_workspace_identity(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("workspace identity path must be absolute");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        bail!("workspace identity path must not contain dot segments");
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(mut canonical) = cursor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Ok(canonical);
+        }
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| anyhow!("workspace identity has no canonical ancestor"))?;
+        suffix.push(name.to_os_string());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow!("workspace identity has no parent"))?;
+    }
+}
+
 fn validate_retirement_authorization(
     record: &SessionRecord,
     intent: &RetirementIntent,
@@ -1549,12 +1587,19 @@ fn validate_retirement_authorization(
     {
         return Err(RetirementReasonCode::ScopeMismatch);
     }
-    let observed_workspace = PathBuf::from(&record.workspace)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&record.workspace))
-        .display()
-        .to_string();
-    if intent.workspace_identity != observed_workspace {
+    let workspace_path = Path::new(&record.workspace);
+    let workspace_identity_matches = if workspace_path.exists() {
+        canonical_workspace_identity(workspace_path)
+            .map(|path| intent.workspace_identity == path.display().to_string())
+            .unwrap_or(false)
+    } else {
+        let persisted = workspace_path.display().to_string();
+        intent.workspace_identity == persisted
+            || canonical_workspace_identity(workspace_path)
+                .map(|path| intent.workspace_identity == path.display().to_string())
+                .unwrap_or(false)
+    };
+    if !workspace_identity_matches {
         return Err(RetirementReasonCode::ScopeMismatch);
     }
     let claim = MaterialAuthorizationClaim {

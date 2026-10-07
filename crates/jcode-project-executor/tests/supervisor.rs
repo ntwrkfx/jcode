@@ -213,14 +213,16 @@ async fn git_remains_usable_inside_isolated_worktree() {
         .wait_process(id, &process.process_id, None)
         .await
         .unwrap();
-    assert_eq!(
-        state,
-        jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) }
-    );
     let output = supervisor
         .read_process(id, &process.process_id, 0, 0, 1024)
         .await
         .unwrap();
+    assert_eq!(
+        state,
+        jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) },
+        "stderr: {}",
+        output.stderr_data
+    );
     assert_eq!(output.data, "");
     supervisor.close_session(id).await.unwrap();
 }
@@ -262,7 +264,7 @@ async fn existing_worktree_binding_preserves_external_tree_and_enforces_writer_l
     assert_eq!(created.worktree_binding.access_mode, AccessMode::Write);
     assert_eq!(
         created.worktree_binding.path,
-        external.display().to_string()
+        external.canonicalize().unwrap().display().to_string()
     );
 
     let writer_b = "bbbbbbbb-2222-4222-8222-222222222222";
@@ -367,7 +369,7 @@ async fn read_binding_is_read_only_and_worktree_discovery_reports_writer() {
             .await
             .unwrap()
             .iter()
-            .any(|item| item.path == external.display().to_string())
+            .any(|item| item.path == external.canonicalize().unwrap().display().to_string())
     );
 
     let reader = "12121212-7777-4777-8777-777777777777";

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,7 +14,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const BWRAP_PATH: &str = "/usr/bin/bwrap";
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionProcessState {
@@ -89,9 +94,16 @@ impl ExecutionProcessManager {
         if !workspace.is_dir() {
             bail!("executor workspace must be a directory");
         }
+        #[cfg(target_os = "linux")]
         if !Path::new(BWRAP_PATH).is_file() {
             bail!("project executor requires {BWRAP_PATH}");
         }
+        #[cfg(target_os = "macos")]
+        if !Path::new(SANDBOX_EXEC_PATH).is_file() {
+            bail!("project executor requires {SANDBOX_EXEC_PATH}");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        bail!("project executor process containment is unsupported on this platform");
         let git_common_dir = resolve_git_common_dir(&workspace)?;
         let state_root = state_root.as_ref().to_path_buf();
         std::fs::create_dir_all(state_root.join("processes"))
@@ -258,6 +270,23 @@ impl ExecutionProcessManager {
     }
 
     fn sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.linux_sandbox_command(argv, cwd);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return self.macos_sandbox_command(argv, cwd);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (argv, cwd);
+            bail!("project executor process containment is unsupported on this platform");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
         let mut command = Command::new(BWRAP_PATH);
         command.env_clear();
         command.args([
@@ -345,6 +374,109 @@ impl ExecutionProcessManager {
         Ok(command)
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
+        let runtime_root = self.state_root.join("sandbox-runtime");
+        let home = runtime_root.join("home");
+        let tmp = runtime_root.join("tmp");
+        std::fs::create_dir_all(&home).context("create macOS sandbox HOME")?;
+        std::fs::create_dir_all(&tmp).context("create macOS sandbox TMPDIR")?;
+
+        let profile = self.macos_sandbox_profile(&runtime_root)?;
+        let mut command = Command::new(SANDBOX_EXEC_PATH);
+        command.env_clear();
+        command
+            .arg("-p")
+            .arg(profile)
+            .arg("--")
+            .arg(&argv[0])
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .env("HOME", &home)
+            .env("TMPDIR", &tmp)
+            .env(
+                "PATH",
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            )
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("TERM", "dumb")
+            .env("USER", "executor")
+            .env("LOGNAME", "executor");
+        Ok(command)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_profile(&self, runtime_root: &Path) -> Result<String> {
+        let mut metadata_paths = vec![self.workspace.clone(), runtime_root.to_path_buf()];
+        if let Some(git_common_dir) = &self.git_common_dir {
+            metadata_paths.push(git_common_dir.clone());
+        }
+
+        let workspace = seatbelt_path(&self.workspace)?;
+        let runtime_root_value = seatbelt_path(runtime_root)?;
+        let mut rules = vec![
+            "(version 1)".to_owned(),
+            "(allow default)".to_owned(),
+            "(deny network*)".to_owned(),
+            "(deny file-read* (subpath \"/Volumes\"))".to_owned(),
+            "(deny file-write* (subpath \"/Volumes\"))".to_owned(),
+            "(deny file-read* (subpath \"/private/tmp\"))".to_owned(),
+            "(deny file-write* (subpath \"/private/tmp\"))".to_owned(),
+            "(deny file-read* (subpath \"/Users\"))".to_owned(),
+            "(deny file-write* (subpath \"/Users\"))".to_owned(),
+            "(deny file-read* (subpath \"/private/var/folders\"))".to_owned(),
+            "(deny file-write* (subpath \"/private/var/folders\"))".to_owned(),
+        ];
+
+        if let Some(parent) = self.workspace.parent() {
+            let parent = seatbelt_path(parent)?;
+            rules.push(format!("(deny file-read* (subpath \"{parent}\"))"));
+            rules.push(format!("(deny file-write* (subpath \"{parent}\"))"));
+        }
+        if let Some(user_root) = macos_user_root(&self.workspace) {
+            let user_root = seatbelt_path(&user_root)?;
+            rules.push(format!("(deny file-read* (subpath \"{user_root}\"))"));
+            rules.push(format!("(deny file-write* (subpath \"{user_root}\"))"));
+        }
+
+        for allowed_path in metadata_paths {
+            for ancestor in allowed_path.ancestors().skip(1) {
+                if ancestor == Path::new("/") {
+                    continue;
+                }
+                let ancestor = seatbelt_path(ancestor)?;
+                rules.push(format!(
+                    "(allow file-read-metadata (literal \"{ancestor}\"))"
+                ));
+            }
+        }
+
+        rules.push(format!("(allow file-read* (subpath \"{workspace}\"))"));
+        if self.writable {
+            rules.push(format!("(allow file-write* (subpath \"{workspace}\"))"));
+        }
+        if let Some(git_common_dir) = &self.git_common_dir {
+            let git_common_dir = seatbelt_path(git_common_dir)?;
+            rules.push(format!(
+                "(allow file-read* (subpath \"{git_common_dir}\"))"
+            ));
+            if self.writable {
+                rules.push(format!(
+                    "(allow file-write* (subpath \"{git_common_dir}\"))"
+                ));
+            }
+        }
+        rules.push(format!(
+            "(allow file-read* (subpath \"{runtime_root_value}\"))"
+        ));
+        rules.push(format!(
+            "(allow file-write* (subpath \"{runtime_root_value}\"))"
+        ));
+
+        Ok(rules.join("\n"))
+    }
+
     fn resolve_cwd(&self, cwd: Option<&str>) -> Result<PathBuf> {
         let candidate = match cwd {
             None => self.workspace.clone(),
@@ -364,6 +496,35 @@ impl ExecutionProcessManager {
     }
 }
 
+
+#[cfg(target_os = "macos")]
+fn seatbelt_path(path: &Path) -> Result<String> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize macOS sandbox path {}", path.display()))?;
+    let value = canonical
+        .to_str()
+        .ok_or_else(|| anyhow!("macOS sandbox path is not valid UTF-8: {}", canonical.display()))?;
+    if value.as_bytes().iter().any(|byte| matches!(byte, 34 | 92)) {
+        bail!("macOS sandbox path contains unsupported quoting characters");
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_user_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return None;
+    }
+    if components.next()?.as_os_str() != "Users" {
+        return None;
+    }
+    let user = components.next()?.as_os_str();
+    Some(Path::new("/Users").join(user))
+}
+
+
 async fn read_stream(path: &Path, offset: u64, limit: usize) -> Result<(String, u64, u64)> {
     let mut file = tokio::fs::File::open(path).await?;
     let len = file.metadata().await?.len();
@@ -380,6 +541,7 @@ async fn read_stream(path: &Path, offset: u64, limit: usize) -> Result<(String, 
     Ok((String::from_utf8_lossy(&bytes).into_owned(), next_offset, len))
 }
 
+#[cfg(target_os = "linux")]
 fn add_mount_parents(directories: &mut BTreeSet<PathBuf>, path: &Path) {
     let mut parents: Vec<PathBuf> = path
         .ancestors()
