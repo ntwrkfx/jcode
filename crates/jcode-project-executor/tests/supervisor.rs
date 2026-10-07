@@ -4,6 +4,7 @@ use jcode_project_executor::{
 };
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 const AUTH_DIGEST: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -226,6 +227,81 @@ async fn git_remains_usable_inside_isolated_worktree() {
     );
     assert_eq!(output.data, "");
     supervisor.close_session(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_read_session_is_read_only_without_write_custody() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let sha = make_repo(&repo);
+    let supervisor = ProjectExecutorSupervisor::create_with_worktree_root(
+        root.path().join("sessions"),
+        root.path(),
+        "acacacacacacacacacacacacacacacacacacacac",
+    )
+    .unwrap();
+    let id = "abababab-1010-4010-8010-101010101010";
+    let mut req = request(id, &repo, &sha);
+    req.access_mode = Some(AccessMode::Read);
+    req.authorization_digest = None;
+    let created = supervisor.create_session(req).await.unwrap();
+    assert_eq!(created.worktree_binding.mode, WorktreeMode::Managed);
+    assert_eq!(
+        created.worktree_binding.ownership,
+        WorktreeOwnership::Harness
+    );
+    assert_eq!(created.worktree_binding.access_mode, AccessMode::Read);
+    assert!(created.effect_authorization.is_none());
+    assert!(created.custody_assessment.is_none());
+    let read = supervisor
+        .start_process(
+            id,
+            vec!["git".into(), "rev-parse".into(), "HEAD".into()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let state = supervisor
+        .wait_process(id, &read.process_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(
+        state,
+        jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) }
+    );
+    let output = supervisor
+        .read_process(id, &read.process_id, 0, 0, 128)
+        .await
+        .unwrap();
+    assert_eq!(output.data.trim(), sha);
+
+    let write = supervisor
+        .start_process(
+            id,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf denied > should-not-exist".into(),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let state = supervisor
+        .wait_process(id, &write.process_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_ne!(
+        state,
+        jcode_project_executor::ExecutionProcessState::Exited { code: Some(0) }
+    );
+    assert!(
+        !Path::new(&created.workspace)
+            .join("should-not-exist")
+            .exists()
+    );
 }
 
 #[tokio::test]

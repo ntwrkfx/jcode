@@ -77,3 +77,17 @@ It does **not** establish:
 - P4, P5, P6, or mutation authority.
 
 Next dependency: **E2 — bind the current Harness `project-executor/v1` seam to this exact candidate/runtime identity without promoting Registry authority.**
+
+## Managed read-only extension — E3 prerequisite
+
+A follow-on E3 gate exposed that managed sessions previously defaulted unconditionally to write access. The candidate now accepts explicit `access_mode=read` for a managed worktree while preserving `write` as the compatibility default when no mode is supplied.
+
+For a managed read binding the executor:
+
+- creates no write custody grant;
+- creates no effect-authorization binding;
+- runs its process sandbox with the workspace non-writable;
+- permits bounded reads such as `git rev-parse HEAD`;
+- rejects workspace writes at the Darwin sandbox boundary.
+
+The full Project Executor suite after this extension is **135 passed / 0 failed**.

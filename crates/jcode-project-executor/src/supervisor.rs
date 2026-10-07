@@ -675,8 +675,8 @@ impl ProjectExecutorSupervisor {
             bail!("work_identity must not be empty");
         }
         validate_sha(&request.base_sha, "base_sha")?;
-        let write_requested =
-            request.worktree_path.is_none() || request.access_mode == Some(AccessMode::Write);
+        let requested_access_mode = request.access_mode.unwrap_or(AccessMode::Write);
+        let write_requested = requested_access_mode == AccessMode::Write;
         if write_requested {
             let digest = request
                 .authorization_digest
@@ -753,9 +753,6 @@ impl ProjectExecutorSupervisor {
                 (workspace, session_branch, binding, false)
             }
             None => {
-                if request.access_mode.is_some() {
-                    bail!("access_mode requires worktree_path");
-                }
                 std::fs::create_dir(&session_dir).context("create executor session directory")?;
                 let workspace = session_dir.join("workspace");
                 let add_result = Command::new("git")
@@ -780,7 +777,7 @@ impl ProjectExecutorSupervisor {
                     path: workspace.display().to_string(),
                     repository: request.repository.clone(),
                     resolved_sha: request.base_sha.clone(),
-                    access_mode: AccessMode::Write,
+                    access_mode: requested_access_mode,
                     device_id: None,
                     git_common_dir: None,
                 };
