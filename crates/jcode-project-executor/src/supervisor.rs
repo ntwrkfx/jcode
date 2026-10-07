@@ -626,7 +626,7 @@ impl ProjectExecutorSupervisor {
         validate_sha(&head_sha, "worktree HEAD")?;
         let branch = branch(path)?;
         let dirty = !git(path, &["status", "--porcelain"])?.is_empty();
-        let owner = command_output("stat", &["-c", "%U", &path.display().to_string()])?;
+        let owner = path_owner_name(path)?;
         let writer = self.writer_for_path(path).await?;
         Ok(WorktreeInspection {
             schema_version: WORKTREE_INSPECTION_SCHEMA_VERSION.to_owned(),
@@ -2123,6 +2123,21 @@ fn git(repository: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(unix)]
+fn path_owner_name(path: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(path)
+        .with_context(|| format!("stat worktree owner: {}", path.display()))?
+        .uid()
+        .to_string();
+    command_output("id", &["-nu", &uid])
+}
+
+#[cfg(not(unix))]
+fn path_owner_name(_path: &Path) -> Result<String> {
+    bail!("worktree owner inspection is unsupported on this platform")
 }
 
 fn command_output(program: &str, args: &[&str]) -> Result<String> {

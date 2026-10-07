@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,7 +14,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const BWRAP_PATH: &str = "/usr/bin/bwrap";
+
+#[cfg(target_os = "macos")]
+const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionProcessState {
@@ -89,9 +95,7 @@ impl ExecutionProcessManager {
         if !workspace.is_dir() {
             bail!("executor workspace must be a directory");
         }
-        if !Path::new(BWRAP_PATH).is_file() {
-            bail!("project executor requires {BWRAP_PATH}");
-        }
+        ensure_platform_sandbox_available()?;
         let git_common_dir = resolve_git_common_dir(&workspace)?;
         let state_root = state_root.as_ref().to_path_buf();
         std::fs::create_dir_all(state_root.join("processes"))
@@ -115,12 +119,26 @@ impl ExecutionProcessManager {
         }
         let cwd = self.resolve_cwd(cwd.as_deref())?;
         let process_id = format!("p-{}", Uuid::new_v4().simple());
-        let stdout_path = self.state_root.join("processes").join(format!("{process_id}.stdout"));
-        let stderr_path = self.state_root.join("processes").join(format!("{process_id}.stderr"));
-        let stdout = OpenOptions::new().create_new(true).read(true).write(true)
-            .open(&stdout_path).context("create process stdout file")?;
-        let stderr = OpenOptions::new().create_new(true).read(true).write(true)
-            .open(&stderr_path).context("create process stderr file")?;
+        let stdout_path = self
+            .state_root
+            .join("processes")
+            .join(format!("{process_id}.stdout"));
+        let stderr_path = self
+            .state_root
+            .join("processes")
+            .join(format!("{process_id}.stderr"));
+        let stdout = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&stdout_path)
+            .context("create process stdout file")?;
+        let stderr = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&stderr_path)
+            .context("create process stderr file")?;
 
         let mut command = self.sandbox_command(&argv, &cwd)?;
         command.stdin(Stdio::null());
@@ -167,7 +185,8 @@ impl ExecutionProcessManager {
         }
         let record = self.record(process_id).await?;
         let state = self.refresh(&record).await?;
-        let (data, next_offset, stdout_len) = read_stream(&record.stdout_path, offset, limit).await?;
+        let (data, next_offset, stdout_len) =
+            read_stream(&record.stdout_path, offset, limit).await?;
         let (stderr_data, stderr_next_offset, stderr_len) =
             read_stream(&record.stderr_path, stderr_offset, limit).await?;
         Ok(ExecutionProcessOutput {
@@ -257,6 +276,7 @@ impl ExecutionProcessManager {
         Ok(state)
     }
 
+    #[cfg(target_os = "linux")]
     fn sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
         let mut command = Command::new(BWRAP_PATH);
         command.env_clear();
@@ -345,6 +365,84 @@ impl ExecutionProcessManager {
         Ok(command)
     }
 
+    #[cfg(target_os = "macos")]
+    fn sandbox_command(&self, argv: &[String], cwd: &Path) -> Result<Command> {
+        let workspace = self
+            .workspace
+            .to_str()
+            .ok_or_else(|| anyhow!("executor workspace is not valid UTF-8"))?;
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("process cwd is not valid UTF-8"))?;
+        let mut profile = String::from(
+            "(version 1)\n\
+             (deny default)\n\
+             (allow process*)\n\
+             (allow signal (target same-sandbox))\n\
+             (allow sysctl-read)\n\
+             (allow mach-lookup)\n\
+             (allow file-read*)\n\
+             (deny file-read* (subpath \"/Users\"))\n\
+             (deny file-read* (subpath \"/Volumes\"))\n\
+             (deny file-read* (subpath \"/Network\"))\n\
+             (deny file-read* (subpath \"/private/tmp\"))\n\
+             (deny file-read* (subpath \"/private/var/folders\"))\n\
+             (allow file-write* (literal \"/dev/null\"))\n",
+        );
+        append_metadata_ancestor_rules(&mut profile, &self.workspace);
+        profile.push_str(&format!(
+            "(allow file-read* (subpath {}))\n",
+            sandbox_literal(workspace)
+        ));
+        if let Some(git_common_dir) = &self.git_common_dir {
+            append_metadata_ancestor_rules(&mut profile, git_common_dir);
+            let git_common_dir = git_common_dir
+                .to_str()
+                .ok_or_else(|| anyhow!("git common directory is not valid UTF-8"))?;
+            profile.push_str(&format!(
+                "(allow file-read* (subpath {}))\n",
+                sandbox_literal(git_common_dir)
+            ));
+            if self.writable {
+                profile.push_str(&format!(
+                    "(allow file-write* (subpath {}))\n",
+                    sandbox_literal(git_common_dir)
+                ));
+            }
+        }
+        if self.writable {
+            profile.push_str(&format!(
+                "(allow file-write* (subpath {}))\n",
+                sandbox_literal(workspace)
+            ));
+        }
+        let mut command = Command::new(SANDBOX_EXEC_PATH);
+        command.env_clear();
+        command.arg("-p").arg(profile);
+        command.arg("/usr/bin/env");
+        command.args([
+            "-i",
+            "HOME=/tmp",
+            "TMPDIR=/tmp",
+            "PATH=/Library/Developer/CommandLineTools/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            "TERM=dumb",
+            "USER=executor",
+            "LOGNAME=executor",
+        ]);
+        command.arg(format!("PWD={cwd}"));
+        command.current_dir(cwd);
+        command.arg(&argv[0]);
+        command.args(&argv[1..]);
+        Ok(command)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn sandbox_command(&self, _argv: &[String], _cwd: &Path) -> Result<Command> {
+        bail!("project executor has no bounded process sandbox for this platform")
+    }
+
     fn resolve_cwd(&self, cwd: Option<&str>) -> Result<PathBuf> {
         let candidate = match cwd {
             None => self.workspace.clone(),
@@ -364,6 +462,51 @@ impl ExecutionProcessManager {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_platform_sandbox_available() -> Result<()> {
+    if !Path::new(BWRAP_PATH).is_file() {
+        bail!("project executor requires {BWRAP_PATH}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_platform_sandbox_available() -> Result<()> {
+    if !Path::new(SANDBOX_EXEC_PATH).is_file() {
+        bail!("project executor requires {SANDBOX_EXEC_PATH}");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_platform_sandbox_available() -> Result<()> {
+    bail!("project executor has no bounded process sandbox for this platform")
+}
+
+#[cfg(target_os = "macos")]
+fn append_metadata_ancestor_rules(profile: &mut String, path: &Path) {
+    let mut ancestors: Vec<&Path> = path
+        .ancestors()
+        .skip(1)
+        .filter(|p| *p != Path::new("/"))
+        .collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if let Some(value) = ancestor.to_str() {
+            profile.push_str(&format!(
+                "(allow file-read-metadata (literal {}))\n",
+                sandbox_literal(value)
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 async fn read_stream(path: &Path, offset: u64, limit: usize) -> Result<(String, u64, u64)> {
     let mut file = tokio::fs::File::open(path).await?;
     let len = file.metadata().await?.len();
@@ -377,9 +520,14 @@ async fn read_stream(path: &Path, offset: u64, limit: usize) -> Result<(String, 
         file.read_exact(&mut bytes).await?;
     }
     let next_offset = offset + count as u64;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), next_offset, len))
+    Ok((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        next_offset,
+        len,
+    ))
 }
 
+#[cfg(target_os = "linux")]
 fn add_mount_parents(directories: &mut BTreeSet<PathBuf>, path: &Path) {
     let mut parents: Vec<PathBuf> = path
         .ancestors()

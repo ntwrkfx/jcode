@@ -130,22 +130,24 @@ async fn process_filesystem_and_environment_are_project_bounded() {
     std::fs::create_dir(&workspace).unwrap();
     let outside = root.path().join("outside-secret.txt");
     std::fs::write(&outside, "must-not-leak").unwrap();
+    #[cfg(target_os = "linux")]
     let host_pid_namespace = std::fs::read_link("/proc/self/ns/pid").unwrap();
     let manager = ExecutionProcessManager::create(&workspace).unwrap();
 
+    #[cfg(target_os = "linux")]
+    let command = format!(
+        "test ! -e '{}' && test \"$(readlink /proc/self/ns/pid)\" != '{}' && printf bounded",
+        outside.display(),
+        host_pid_namespace.display()
+    );
+    #[cfg(target_os = "macos")]
+    let command = format!(
+        "test ! -e '{}' && test \"$HOME\" = /tmp && printf bounded",
+        outside.display()
+    );
+
     let process = manager
-        .start(
-            argv(&[
-                "/bin/sh",
-                "-c",
-                &format!(
-                    "test ! -e '{}' && test \"$(readlink /proc/self/ns/pid)\" != '{}' && printf bounded",
-                    outside.display(),
-                    host_pid_namespace.display()
-                ),
-            ]),
-            None,
-        )
+        .start(argv(&["/bin/sh", "-c", &command]), None)
         .await
         .unwrap();
     let state = manager.wait(&process.process_id, None).await.unwrap();
@@ -169,13 +171,96 @@ async fn stdout_and_stderr_have_independent_cursors() {
 
     let first = manager.read(&process.process_id, 0, 0, 3).await.unwrap();
     assert_eq!((first.data.as_str(), first.next_offset), ("abc", 3));
-    assert_eq!((first.stderr_data.as_str(), first.stderr_next_offset), ("123", 3));
+    assert_eq!(
+        (first.stderr_data.as_str(), first.stderr_next_offset),
+        ("123", 3)
+    );
     assert!(!first.eof);
     assert!(!first.stderr_eof);
 
     let second = manager.read(&process.process_id, 3, 3, 3).await.unwrap();
     assert_eq!((second.data.as_str(), second.next_offset), ("def", 6));
-    assert_eq!((second.stderr_data.as_str(), second.stderr_next_offset), ("45", 5));
+    assert_eq!(
+        (second.stderr_data.as_str(), second.stderr_next_offset),
+        ("45", 5)
+    );
     assert!(second.eof);
     assert!(second.stderr_eof);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn darwin_denies_outside_write() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = root.path().join("outside.txt");
+    let manager = ExecutionProcessManager::create(&workspace).unwrap();
+
+    let process = manager
+        .start(
+            argv(&[
+                "/bin/sh",
+                "-c",
+                &format!("printf leaked > '{}'", outside.display()),
+            ]),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = manager.wait(&process.process_id, None).await.unwrap();
+    assert_ne!(state, ExecutionProcessState::Exited { code: Some(0) });
+    assert!(!outside.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn darwin_denies_symlink_read_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let outside = root.path().join("secret.txt");
+    std::fs::write(&outside, "must-not-leak").unwrap();
+    symlink(&outside, workspace.join("escape-link")).unwrap();
+    let manager = ExecutionProcessManager::create(&workspace).unwrap();
+
+    let process = manager
+        .start(
+            argv(&["/bin/sh", "-c", "cat escape-link >/dev/null 2>&1"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = manager.wait(&process.process_id, None).await.unwrap();
+    assert_ne!(state, ExecutionProcessState::Exited { code: Some(0) });
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn darwin_scrubs_host_environment() {
+    let workspace = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("PROJECT_EXECUTOR_HOST_SECRET", "must-not-leak");
+    }
+    let manager = ExecutionProcessManager::create(workspace.path()).unwrap();
+    let process = manager
+        .start(
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "test -z \"${PROJECT_EXECUTOR_HOST_SECRET:-}\" && printf scrubbed",
+            ]),
+            None,
+        )
+        .await
+        .unwrap();
+    let state = manager.wait(&process.process_id, None).await.unwrap();
+    assert_eq!(state, ExecutionProcessState::Exited { code: Some(0) });
+    let output = manager.read(&process.process_id, 0, 0, 64).await.unwrap();
+    assert_eq!(output.data, "scrubbed");
+    unsafe {
+        std::env::remove_var("PROJECT_EXECUTOR_HOST_SECRET");
+    }
 }

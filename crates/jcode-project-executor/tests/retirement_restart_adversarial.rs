@@ -64,7 +64,7 @@ async fn persisted_intent_plus_absent_workspace_without_receipt_is_ambiguous_aft
     let execution_id = "cb000000-0000-4000-8000-00000000000b";
     let session_dir = sessions.join(execution_id);
     std::fs::create_dir_all(session_dir.join("evidence/retirement/intents")).unwrap();
-    let workspace_identity = workspace.canonicalize().unwrap().display().to_string();
+    let workspace_identity = workspace.display().to_string();
     let record = serde_json::json!({
         "schema_version":"project-executor-session/v2", "execution_id":execution_id,
         "provider":"project-executor", "implementation":"jcode-derived-executor/v1",
