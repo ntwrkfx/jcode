@@ -590,6 +590,15 @@ impl ProjectExecutorSupervisor {
         &self.executor_instance_id
     }
 
+    /// Native identity observed from this supervisor, not an admission grant.
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
+    }
+
+    pub fn implementation_revision(&self) -> &str {
+        &self.implementation_revision
+    }
+
     pub async fn list_worktrees(&self) -> Result<Vec<WorktreeInspection>> {
         let mut results = Vec::new();
         for path in discover_worktree_paths(&self.worktree_root)? {
