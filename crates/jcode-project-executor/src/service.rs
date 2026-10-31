@@ -155,6 +155,12 @@ async fn handle_inner(
                 "protocol": EXECUTOR_PROTOCOL_VERSION,
                 "status": "ready",
                 "service": {"state": "SERVING"},
+                "identity": {
+                    "device_id": supervisor.device_id(),
+                    "executor_instance_id": supervisor.executor_instance_id(),
+                    "implementation_revision": supervisor.implementation_revision(),
+                    "authority_effect": "NONE"
+                },
                 "recovery": {
                     "state": recovery.health,
                     "runnable": recovery.runnable,

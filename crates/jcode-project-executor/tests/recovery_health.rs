@@ -53,6 +53,46 @@ async fn health(supervisor: &ProjectExecutorSupervisor) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn health_reports_only_native_identity_without_issuing_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let device = "b26d59a6-24ff-41b5-95a9-2bb983205a76";
+    let revision = "1e024cc283db8932f184b7a9c48d9465c0965d30";
+    let supervisor = ProjectExecutorSupervisor::create_with_worktree_root_and_device_id(
+        root.path().join("sessions"),
+        root.path(),
+        revision,
+        device,
+    )
+    .unwrap();
+    let response = health(&supervisor).await;
+    let identity = &response["identity"];
+    assert_eq!(identity["device_id"], device);
+    assert_eq!(identity["implementation_revision"], revision);
+    assert_eq!(identity["executor_instance_id"], supervisor.executor_instance_id());
+    assert_eq!(identity["authority_effect"], "NONE");
+    assert_eq!(response["status"], "ready");
+    assert!(response.get("authorization").is_none());
+    assert!(response.get("settlement").is_none());
+
+    // Stability is scoped to this instance; health never grants a writer epoch.
+    assert_eq!(health(&supervisor).await["identity"], response["identity"]);
+}
+
+#[tokio::test]
+async fn legacy_supervisor_health_has_no_invented_device_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let supervisor = ProjectExecutorSupervisor::create_with_worktree_root(
+        root.path().join("sessions"),
+        root.path(),
+        "1111111111111111111111111111111111111111",
+    )
+    .unwrap();
+    let identity = health(&supervisor).await["identity"].clone();
+    assert!(identity["device_id"].is_null());
+    assert_eq!(identity["authority_effect"], "NONE");
+}
+
+#[tokio::test]
 async fn health_separates_serving_from_healthy_recovery() {
     let root = tempfile::tempdir().unwrap();
     let supervisor = ProjectExecutorSupervisor::create_with_worktree_root(
